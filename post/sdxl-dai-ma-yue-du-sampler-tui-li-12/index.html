@@ -1,0 +1,342 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDXL代码阅读-Sampler推理(EDM)-1.2 | 谢狗个人博客</title>
+<link rel="shortcut icon" href="https://ShiMinghao0208.github.io/favicon.ico?v=1727341370783">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://ShiMinghao0208.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="SDXL代码阅读-Sampler推理(EDM)-1.2 | 谢狗个人博客 - Atom Feed" href="https://ShiMinghao0208.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="本文紧接上一节的sampler讲解采样器的第三个部分，采样器方法本身。
+Sampler
+主要的方法在BaseDiffusionSampler类中(init、denoise、prepare_sampling_loop)，会基于一些不同的采样方..." />
+    <meta name="keywords" content="SDXL,AIGC学习" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://ShiMinghao0208.github.io">
+  <img class="avatar" src="https://ShiMinghao0208.github.io/images/avatar.png?v=1727341370783" alt="">
+  </a>
+  <h1 class="site-title">
+    谢狗个人博客
+  </h1>
+  <p class="site-description">
+    我不姓谢，但最怕万一见温柔
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="https://ShiMinghao0208.github.io/tags" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              SDXL代码阅读-Sampler推理(EDM)-1.2
+            </h2>
+            <div class="post-info">
+              <span>
+                2024-09-18
+              </span>
+              <span>
+                6 min read
+              </span>
+              
+                <a href="https://ShiMinghao0208.github.io/tag/354-myU_X/" class="post-tag">
+                  # SDXL
+                </a>
+              
+                <a href="https://ShiMinghao0208.github.io/tag/V3dvREVpE/" class="post-tag">
+                  # AIGC学习
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>本文紧接上一节的<a href="https://shiminghao0208.github.io/post/sdxl-dai-ma-yue-du-tui-li-11/#sampler">sampler</a>讲解采样器的第三个部分，采样器方法本身。</p>
+<h1 id="sampler">Sampler</h1>
+<p>主要的方法在BaseDiffusionSampler类中(init、denoise、prepare_sampling_loop)，会基于一些不同的采样方法有一些子类。</p>
+<h2 id="basediffusionsampler">BaseDiffusionSampler</h2>
+<pre><code class="language-python3"># 提供默认值的机制
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+class BaseDiffusionSampler:
+    def __init__(
+        self,
+        discretization,
+        guider,
+        num_steps: Union[int, None] = None,
+        verbose: bool = False,
+        device: str = &quot;cuda&quot;,
+    ):
+        self.num_steps = num_steps
+        self.discretization = discretization
+        self.guider = guider
+        self.verbose = verbose
+        self.device = device
+
+    def prepare_sampling_loop(self, x, cond, uc=None, num_steps=None):
+        '''
+            用于准备迭代采样的元素
+            x: 输入
+            cond: 条件输入
+            uc: 无条件输入，可能用于一些特殊的生成设置或对比实验。
+        '''
+        # 通过调度器生成噪声的标准差sigma
+        sigmas = self.discretization(
+            self.num_steps if num_steps is None else num_steps, device=self.device
+        )
+        uc = default(uc, cond)
+
+        x *= torch.sqrt(1.0 + sigmas[0] ** 2.0)
+        num_sigmas = len(sigmas)
+
+        # s_in 作为一个全 1 张量，通常用于对 sigma 进行缩放操作。在采样过程中，s_in 与 sigma 相乘，确保 sigma 在批次维度上正确广播。
+        # 在采样步骤中，s_in 确保了每一步的 sigma 值可以正确地应用于整个批次的输入张量 x。(来自于chatgpt)
+        s_in = x.new_ones([x.shape[0]])
+
+        return x, s_in, sigmas, num_sigmas, cond, uc
+
+    def denoise(self, x, denoiser, sigma, cond, uc):
+        '''
+            用guider指导消噪的过程
+        '''
+        denoised = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc))
+        denoised = self.guider(denoised, sigma)
+        return denoised
+
+    def get_sigma_gen(self, num_sigmas):
+        sigma_generator = range(num_sigmas - 1)
+        if self.verbose:
+            print(&quot;#&quot; * 30, &quot; Sampling setting &quot;, &quot;#&quot; * 30)
+            print(f&quot;Sampler: {self.__class__.__name__}&quot;)
+            print(f&quot;Discretization: {self.discretization.__class__.__name__}&quot;)
+            print(f&quot;Guider: {self.guider.__class__.__name__}&quot;)
+            sigma_generator = tqdm(
+                sigma_generator,
+                total=num_sigmas,
+                desc=f&quot;Sampling with {self.__class__.__name__} for {num_sigmas} steps&quot;,
+            )
+        return sigma_generator
+</code></pre>
+<h2 id="单步采样">单步采样</h2>
+<p>定义了两个方法，一个是sample_step，这个由具体子类实现；一个是euler_step，这个是欧拉法解ODE。<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726652554963.png" alt="" loading="lazy"></p>
+<pre><code class="language-python3">class SingleStepDiffusionSampler(BaseDiffusionSampler):
+    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc, *args, **kwargs):
+        raise NotImplementedError
+
+    def euler_step(self, x, d, dt):
+        return x + dt * d
+</code></pre>
+<h2 id="edm-sampler">EDM Sampler</h2>
+<p>在EDM Sampler中，最重要的方法就是sample_step。</p>
+<p class='katex-block'><span class="katex-display"><span class="katex"><span class="katex-mathml"><math><semantics><mrow><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mo>=</mo><mi>σ</mi><mo>×</mo><mo>(</mo><mi>γ</mi><mo>+</mo><mn>1</mn><mo>)</mo><mspace linebreak="newline"></mspace><mi>x</mi><mo>=</mo><mi>x</mi><mo>+</mo><mi>ϵ</mi><mo>×</mo><msqrt><msup><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mn>2</mn></msup></msqrt><mo separator="true">,</mo><mspace width="1em"/><mi>i</mi><mi>f</mi><mspace width="1em"/><mi>γ</mi><mo>&gt;</mo><mn>0</mn><mspace linebreak="newline"></mspace><msub><mi>μ</mi><mi>θ</mi></msub><mo>=</mo><mi>d</mi><mi>e</mi><mi>n</mi><mi>o</mi><mi>i</mi><mi>s</mi><mi>e</mi><mi>r</mi><mo>(</mo><mi>x</mi><mo separator="true">,</mo><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mo separator="true">,</mo><mi>c</mi><mo separator="true">,</mo><mi>u</mi><mi>c</mi><mo>)</mo><mspace linebreak="newline"></mspace><mi>d</mi><mo>=</mo><mfrac><mrow><mi>x</mi><mo>−</mo><msub><mi>μ</mi><mi>θ</mi></msub></mrow><mover accent="true"><mi>σ</mi><mo>^</mo></mover></mfrac><mspace linebreak="newline"></mspace><mi>d</mi><mi>t</mi><mo>=</mo><msub><mi>σ</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo>−</mo><mover accent="true"><mi>σ</mi><mo>^</mo></mover><msub><mi>x</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo>=</mo><mi>x</mi><mo>+</mo><mi>d</mi><mo>×</mo><mi>d</mi><mi>t</mi></mrow><annotation encoding="application/x-tex">\hat\sigma = \sigma \times (\gamma + 1) \\
+x = x + \epsilon \times \sqrt{\hat\sigma^2} , \quad if \quad \gamma &gt; 0 \\
+\mu_{\theta} = denoiser(x, \hat\sigma, c, uc) \\
+d = \frac {x - \mu_{\theta}} {\hat\sigma} \\ 
+dt = \sigma_{next} - \hat\sigma
+x_{next} = x + d \times dt
+</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">ϵ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1.198369em;vertical-align:-0.19444em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.003929em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.740108em;"><span style="top:-2.9890000000000003em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-2.9639290000000003em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg width='400em' height='1.08em' viewBox='0 0 400000 1080' preserveAspectRatio='xMinYMin slice'><path d='M95,702c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,
+-10,-9.5,-14c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54c44.2,-33.3,65.8,
+-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10s173,378,173,378c0.7,0,
+35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429c69,-144,104.5,-217.7,106.5,
+-221c5.3,-9.3,12,-14,20,-14H400000v40H845.2724s-225.272,467,-225.272,467
+s-235,486,-235,486c-2.7,4.7,-9,7,-19,7c-6,0,-10,-1,-12,-3s-194,-422,-194,-422
+s-65,47,-65,47z M834 80H400000v40H845z'/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.036070999999999964em;"><span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mspace" style="margin-right:1em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault" style="margin-right:0.10764em;">f</span><span class="mspace" style="margin-right:1em;"></span><span class="mord mathdefault" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.64444em;vertical-align:0em;"></span><span class="mord">0</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.33610799999999996em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right:0.02778em;">θ</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">e</span><span class="mord mathdefault">n</span><span class="mord mathdefault">o</span><span class="mord mathdefault">i</span><span class="mord mathdefault">s</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord mathdefault">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord mathdefault">c</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord mathdefault">u</span><span class="mord mathdefault">c</span><span class="mclose">)</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:1.9463300000000001em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603300000000002em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mord"><span class="mord mathdefault">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.33610799999999996em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right:0.02778em;">θ</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">t</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.73333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">x</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.84444em;vertical-align:-0.15em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mord"><span class="mord mathdefault">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">x</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.77777em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">d</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">t</span></span></span></span></span></p>
+<p>在许多基于扩散模型的采样方法中，噪声标准差 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间的一个函数。例如，在某些扩散模型中，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间 t 的单调函数。通过这种方式，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 实际上隐含地编码了时间信息。因此，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 的变化量可以用来近似时间步长。</p>
+<p>具体来说，如果我们假设 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间 t 的单调函数，那么 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi><mo>(</mo><mi>t</mi><mo>)</mo></mrow><annotation encoding="application/x-tex">\sigma(t)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mopen">(</span><span class="mord mathdefault">t</span><span class="mclose">)</span></span></span></span> 可以表示为 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，并且 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi><mo>(</mo><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi><mo>)</mo></mrow><annotation encoding="application/x-tex">\sigma(t + Δt)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mopen">(</span><span class="mord mathdefault">t</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathdefault">t</span><span class="mclose">)</span></span></span></span> 可以表示为 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mrow><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi></mrow></msub></mrow><annotation encoding="application/x-tex">\sigma_{t+Δt}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.638891em;vertical-align:-0.208331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328331em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">Δ</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.208331em;"><span></span></span></span></span></span></span></span></span></span>。因此，next_sigma - sigma_hat 实际上是 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mrow><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi></mrow></msub><mo>−</mo><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_{t+Δt} - \sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.791661em;vertical-align:-0.208331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328331em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">Δ</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.208331em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，这可以用来近似时间步长 Δt。这种方法简化了时间步长的计算，同时保持了采样过程的稳定性。(来自于GPT)</p>
+<pre><code class="language-python3">class EDMSampler(SingleStepDiffusionSampler):
+    def __init__(
+        self, s_churn=0.0, s_tmin=0.0, s_tmax=float(&quot;inf&quot;), s_noise=1.0, *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.s_churn = s_churn
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+
+    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc=None, gamma=0.0):
+        &quot;&quot;&quot;
+            sigma: 当前步的噪声标准差
+            next_sigma: 下一步的噪声标准差
+            denoiser: 消噪器
+            x: 当前输入
+            cond: 条件输入
+            uc: 无条件输入
+            gamma: 调节参数, 用于给输入x增加一些随机噪声
+        &quot;&quot;&quot;
+        
+        # 计算调节后的sigma_hat
+        sigma_hat = sigma * (gamma + 1.0)
+        # 如果gamma &gt; 0, 也就是sigma受到了调节，就对输入x增加一些随机扰动
+        # x + eps * sigma_hat ** 0.5
+        if gamma &gt; 0:
+            eps = torch.randn_like(x) * self.s_noise
+            x = x + eps * append_dims(sigma_hat**2 - sigma**2, x.ndim) ** 0.5
+
+        denoised = self.denoise(x, denoiser, sigma_hat, cond, uc)
+        d = to_d(x, sigma_hat, denoised)
+        dt = append_dims(next_sigma - sigma_hat, x.ndim)
+
+        euler_step = self.euler_step(x, d, dt)
+        x = self.possible_correction_step(
+            euler_step, x, d, dt, next_sigma, denoiser, cond, uc
+        )
+        return x
+
+    def __call__(self, denoiser, x, cond, uc=None, num_steps=None):
+        x, s_in, sigmas, num_sigmas, cond, uc = self.prepare_sampling_loop(
+            x, cond, uc, num_steps
+        )
+        # 计算gamma的值
+        for i in self.get_sigma_gen(num_sigmas):
+            gamma = (
+                min(self.s_churn / (num_sigmas - 1), 2**0.5 - 1)
+                if self.s_tmin &lt;= sigmas[i] &lt;= self.s_tmax
+                else 0.0
+            )
+            x = self.sampler_step(
+                s_in * sigmas[i],
+                s_in * sigmas[i + 1],
+                denoiser,
+                x,
+                cond,
+                uc,
+                gamma,
+            )
+
+        return x
+
+class EulerEDMSampler(EDMSampler):
+    def possible_correction_step(
+        self, euler_step, x, d, dt, next_sigma, denoiser, cond, uc
+    ):
+        return euler_step
+</code></pre>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#sampler">Sampler</a>
+<ul>
+<li><a href="#basediffusionsampler">BaseDiffusionSampler</a></li>
+<li><a href="#%E5%8D%95%E6%AD%A5%E9%87%87%E6%A0%B7">单步采样</a></li>
+<li><a href="#edm-sampler">EDM Sampler</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-tui-li-11/">
+              <h3 class="post-title">
+                SDXL代码阅读-Pipeline推理-1.1
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://ShiMinghao0208.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

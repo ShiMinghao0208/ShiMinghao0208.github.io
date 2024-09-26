@@ -1,0 +1,1915 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://ShiMinghao0208.github.io</id>
+    <title>谢狗个人博客</title>
+    <updated>2024-09-26T09:02:53.217Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://ShiMinghao0208.github.io"/>
+    <link rel="self" href="https://ShiMinghao0208.github.io/atom.xml"/>
+    <subtitle>我不姓谢，但最怕万一见温柔</subtitle>
+    <logo>https://ShiMinghao0208.github.io/images/avatar.png</logo>
+    <icon>https://ShiMinghao0208.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2024, 谢狗个人博客</rights>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-Loss_fn-2.5]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-loss_fn-25/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-loss_fn-25/">
+        </link>
+        <updated>2024-09-25T02:28:17.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="loss_fn">Loss_fn</h1>
+<p>前面讲的denosier、conditioner在DiffusionEngine的forward阶段都被送入self.loss_fn进行计算，因此Loss_fn具体做了什么也是串联前面内容的重要部分。<br>
+由于Loss_fn的初始化也涉及到其他模块，先来阅读这些模块。<br>
+对应论文表格：<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727232060720.png" alt="" loading="lazy"></p>
+<h2 id="sigma_sampling">sigma_sampling</h2>
+<p>文件来自于generative-models/sgm/modules/diffusionmodules/sigma_sampling.py<br>
+从配置文件(sgm.modules.diffusionmodules.sigma_sampling.EDMSampling)可以知道导入的是EDMSampling，看了一下代码，实际上就是从正态分布里面采样。</p>
+<pre><code class="language-python3">class EDMSampling:
+    &quot;&quot;&quot;
+    通过均值和标准差来控制在对数标准正态分布里来采样
+    &quot;&quot;&quot;
+    def __init__(self, p_mean=-1.2, p_std=1.2):
+        self.p_mean = p_mean
+        self.p_std = p_std
+
+    def __call__(self, n_samples, rand=None):
+        log_sigma = self.p_mean + self.p_std * default(rand, torch.randn((n_samples,)))
+        return log_sigma.exp()
+</code></pre>
+<h2 id="loss_weighting">loss_weighting</h2>
+<p>文件来自于generative-models/sgm/modules/diffusionmodules/loss_weighting.py<br>
+也就是完全对应论文图片</p>
+<pre><code class="language-python3">class EDMWeighting(DiffusionLossWeighting):
+    def __init__(self, sigma_data: float = 0.5):
+        self.sigma_data = sigma_data
+
+    def __call__(self, sigma: torch.Tensor) -&gt; torch.Tensor:
+        return (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
+</code></pre>
+<h2 id="standarddiffusionloss">StandardDiffusionLoss</h2>
+<h3 id="init">init</h3>
+<pre><code class="language-python3">class StandardDiffusionLoss(nn.Module):
+    def __init__(
+        self,
+        sigma_sampler_config: dict,
+        loss_weighting_config: dict,
+        loss_type: str = &quot;l2&quot;,
+        offset_noise_level: float = 0.0,
+        batch2model_keys: Optional[Union[str, List[str]]] = None,
+    ):
+        super().__init__()
+
+        assert loss_type in [&quot;l2&quot;, &quot;l1&quot;, &quot;lpips&quot;]
+
+        self.sigma_sampler = instantiate_from_config(sigma_sampler_config)
+        self.loss_weighting = instantiate_from_config(loss_weighting_config)
+
+        self.loss_type = loss_type
+        self.offset_noise_level = offset_noise_level
+        
+        # lpips是一种用于衡量图像之间感知相似度的损失函数。
+        # 与传统的像素级损失（如 L1 或 L2 损失）不同，LPIPS 通过使用预训练的深度卷积神经网络来捕捉更接近人类视觉感知的相似性。
+        if loss_type == &quot;lpips&quot;:
+            self.lpips = LPIPS().eval()
+
+        if not batch2model_keys:
+            batch2model_keys = []
+        
+        # 模型额外输入的key
+        if isinstance(batch2model_keys, str):
+            batch2model_keys = [batch2model_keys]
+
+        self.batch2model_keys = set(batch2model_keys)
+</code></pre>
+<h3 id="forward">forward</h3>
+<p>真的的前向推理在_forward函数，forward函数就是生成了condition向量然后调用了_forward函数</p>
+<pre><code class="language-python3">    def get_noised_input(
+        self, sigmas_bc: torch.Tensor, noise: torch.Tensor, input: torch.Tensor
+    ) -&gt; torch.Tensor:
+        noised_input = input + noise * sigmas_bc
+        return noised_input
+
+    def forward(
+        self,
+        network: nn.Module,
+        denoiser: Denoiser,
+        conditioner: GeneralConditioner,
+        input: torch.Tensor,
+        batch: Dict,
+    ) -&gt; torch.Tensor:
+        cond = conditioner(batch)
+        return self._forward(network, denoiser, cond, input, batch)
+</code></pre>
+<h3 id="_forward">_forward</h3>
+<pre><code class="language-python3">    def _forward(
+        self,
+        network: nn.Module,
+        denoiser: Denoiser,
+        cond: Dict,
+        input: torch.Tensor,
+        batch: Dict,
+    ) -&gt; Tuple[torch.Tensor, Dict]:
+        # 可能会有一些额外输入
+        additional_model_inputs = {
+            key: batch[key] for key in self.batch2model_keys.intersection(batch)
+        }
+        # 生成对数正态分布的采样
+        sigmas = self.sigma_sampler(input.shape[0]).to(input)
+
+        # self.offset_noise_level &gt; 0.0的话就对noise再加偏移，这个偏移本身也是noise的
+        noise = torch.randn_like(input)
+        if self.offset_noise_level &gt; 0.0:
+            offset_shape = (
+                (input.shape[0], 1, input.shape[2])
+                if self.n_frames is not None
+                else (input.shape[0], input.shape[1])
+            )
+            noise = noise + self.offset_noise_level * append_dims(
+                torch.randn(offset_shape, device=input.device),
+                input.ndim,
+            )
+        
+        # 对图片加噪
+        sigmas_bc = append_dims(sigmas, input.ndim)
+        noised_input = self.get_noised_input(sigmas_bc, noise, input)
+
+        # 模型输出，也就是denoiser，也就是score matching
+        model_output = denoiser(
+            network, noised_input, sigmas, cond, **additional_model_inputs
+        )
+        # 计算权重
+        w = append_dims(self.loss_weighting(sigmas), input.ndim)
+        
+        # return就是具体loss，比如l2loss
+        return self.get_loss(model_output, input, w)
+
+    def get_loss(self, model_output, target, w):
+        if self.loss_type == &quot;l2&quot;:
+            return torch.mean(
+                (w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1
+            )
+        elif self.loss_type == &quot;l1&quot;:
+            return torch.mean(
+                (w * (model_output - target).abs()).reshape(target.shape[0], -1), 1
+            )
+        elif self.loss_type == &quot;lpips&quot;:
+            loss = self.lpips(model_output, target).reshape(-1)
+            return loss
+        else:
+            raise NotImplementedError(f&quot;Unknown loss type {self.loss_type}&quot;)
+</code></pre>
+<h2 id="小结">小结</h2>
+<p>loss_fn相当于就是完成了论文中公式2、3<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727235102946.png" alt="" loading="lazy"><br>
+但是这里非常反直觉的一个点是，得分匹配计算的D()用于拟合实际图片输入y</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-Conditioner-2.4]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-conditioner-24/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-conditioner-24/">
+        </link>
+        <updated>2024-09-24T08:47:46.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="conditioner">Conditioner</h1>
+<p>在DiffusionEngine中同样也通过配置文件初始化了self.conditioner，这个部分主要是控制条件向量的生成，以及在loss_fn里面也会用到他，因此我们来看一下。</p>
+<h2 id="generalconditioner">GeneralConditioner</h2>
+<p>代码路径：generative-models/sgm/modules/encoders/modules.py<br>
+这也是配置文件直接初始化的self.conditioner，其主要功能也是初始化embedding model，然后根据一些参数去做conditioner和unconditioner的向量生成。</p>
+<pre><code class="language-python3">class GeneralConditioner(nn.Module):
+    # 将不同维度的输出映射到特定的键
+    OUTPUT_DIM2KEYS = {2: &quot;vector&quot;, 3: &quot;crossattn&quot;, 4: &quot;concat&quot;} # , 5: &quot;concat&quot;}
+    # 将不同维度的输出映射到特定的键
+    KEY2CATDIM = {&quot;vector&quot;: 1, &quot;crossattn&quot;: 2, &quot;concat&quot;: 1, &quot;cond_view&quot;: 1, &quot;cond_motion&quot;: 1}
+
+    def __init__(self, emb_models: Union[List, ListConfig]):
+        super().__init__()
+        embedders = []
+        # 初始化emb模型，并设置一些参数
+        for n, embconfig in enumerate(emb_models):
+            embedder = instantiate_from_config(embconfig)
+            assert isinstance(
+                embedder, AbstractEmbModel
+            ), f&quot;embedder model {embedder.__class__.__name__} has to inherit from AbstractEmbModel&quot;
+            embedder.is_trainable = embconfig.get(&quot;is_trainable&quot;, False)
+            embedder.ucg_rate = embconfig.get(&quot;ucg_rate&quot;, 0.0)
+            if not embedder.is_trainable:
+                embedder.train = disabled_train
+                for param in embedder.parameters():
+                    param.requires_grad = False
+                embedder.eval()
+            print(
+                f&quot;Initialized embedder #{n}: {embedder.__class__.__name__} &quot;
+                f&quot;with {count_params(embedder, False)} params. Trainable: {embedder.is_trainable}&quot;
+            )
+
+            # emb模型必须要有input_key或者input_keys键
+            if &quot;input_key&quot; in embconfig:
+                embedder.input_key = embconfig[&quot;input_key&quot;]
+            elif &quot;input_keys&quot; in embconfig:
+                embedder.input_keys = embconfig[&quot;input_keys&quot;]
+            else:
+                raise KeyError(
+                    f&quot;need either 'input_key' or 'input_keys' for embedder {embedder.__class__.__name__}&quot;
+                )
+
+            # 如果legacy_ucg_val存在就初始化一个随机数生成器
+            embedder.legacy_ucg_val = embconfig.get(&quot;legacy_ucg_value&quot;, None)
+            if embedder.legacy_ucg_val is not None:
+                embedder.ucg_prng = np.random.RandomState()
+
+            embedders.append(embedder)
+        self.embedders = nn.ModuleList(embedders)
+
+    def possibly_get_ucg_val(self, embedder: AbstractEmbModel, batch: Dict) -&gt; Dict:
+        # 根据 ucg_rate 随机替换批量数据中的值
+        assert embedder.legacy_ucg_val is not None
+        p = embedder.ucg_rate
+        val = embedder.legacy_ucg_val
+        for i in range(len(batch[embedder.input_key])):
+            if embedder.ucg_prng.choice(2, p=[1 - p, p]):
+                batch[embedder.input_key][i] = val
+        return batch
+
+    def forward(
+        self, batch: Dict, force_zero_embeddings: Optional[List] = None
+    ) -&gt; Dict:
+        output = dict()
+        if force_zero_embeddings is None:
+            force_zero_embeddings = []
+            
+        # 根据legacy_ucg_val的值来判断是否要对数据做处理，也就是上面的possibly_get_ucg_val
+        for embedder in self.embedders:
+            embedding_context = nullcontext if embedder.is_trainable else torch.no_grad
+            with embedding_context():
+                if hasattr(embedder, &quot;input_key&quot;) and (embedder.input_key is not None):
+                    if embedder.legacy_ucg_val is not None:
+                        batch = self.possibly_get_ucg_val(embedder, batch)
+                    emb_out = embedder(batch[embedder.input_key])
+                elif hasattr(embedder, &quot;input_keys&quot;):
+                    emb_out = embedder(*[batch[k] for k in embedder.input_keys])
+            assert isinstance(
+                emb_out, (torch.Tensor, list, tuple)
+            ), f&quot;encoder outputs must be tensors or a sequence, but got {type(emb_out)}&quot;
+            if not isinstance(emb_out, (list, tuple)):
+                emb_out = [emb_out]
+            
+            # 对emb_out进行一下处理
+            for emb in emb_out:
+                # 确定out_key(因为SD整个过程中基本上都用dict的形式传递数据)
+                if embedder.input_key in [&quot;cond_view&quot;, &quot;cond_motion&quot;]:
+                    out_key = embedder.input_key
+                else:
+                    out_key = self.OUTPUT_DIM2KEYS[emb.dim()]
+
+                # 如果 ucg_rate &gt; 0 且 legacy_ucg_val 为空，使用伯努利分布生成随机掩码，并应用于嵌入输出。
+                if embedder.ucg_rate &gt; 0.0 and embedder.legacy_ucg_val is None:
+                    emb = (
+                        expand_dims_like(
+                            torch.bernoulli(
+                                (1.0 - embedder.ucg_rate)
+                                * torch.ones(emb.shape[0], device=emb.device)
+                            ),
+                            emb,
+                        )
+                        * emb
+                    )
+                # 如果 input_key 在 force_zero_embeddings 中，将嵌入输出设为全零。
+                if (
+                    hasattr(embedder, &quot;input_key&quot;)
+                    and embedder.input_key in force_zero_embeddings
+                ):
+                    emb = torch.zeros_like(emb)
+                
+                # 如果 out_key 已存在于输出字典中，拼接新嵌入输出，否则直接赋值。
+                if out_key in output:
+                    output[out_key] = torch.cat(
+                        (output[out_key], emb), self.KEY2CATDIM[out_key]
+                    )
+                else:
+                    output[out_key] = emb
+        return output
+
+    def get_unconditional_conditioning(
+        self,
+        batch_c: Dict,
+        batch_uc: Optional[Dict] = None,
+        force_uc_zero_embeddings: Optional[List[str]] = None,
+        force_cond_zero_embeddings: Optional[List[str]] = None,
+    ):  
+        # 获取无条件和条件的嵌入表示
+        if force_uc_zero_embeddings is None:
+            force_uc_zero_embeddings = []
+        ucg_rates = list()
+        for embedder in self.embedders:
+            ucg_rates.append(embedder.ucg_rate)
+            # 暂时将 ucg_rate 设为 0，计算条件和无条件的输出，然后恢复 ucg_rate
+            embedder.ucg_rate = 0.0
+        c = self(batch_c, force_cond_zero_embeddings)
+        uc = self(batch_c if batch_uc is None else batch_uc, force_uc_zero_embeddings)
+
+        for embedder, rate in zip(self.embedders, ucg_rates):
+            embedder.ucg_rate = rate
+        return c, uc
+</code></pre>
+<h2 id="classembedder">ClassEmbedder</h2>
+<p>上面看到embedder通过配置文件sgm.modules.encoders.modules.ClassEmbedder初始化，所以我们也来看一眼ClassEmbedder(其实也没啥，就是torch的embedding做一个forward)</p>
+<pre><code class="language-python3">class ClassEmbedder(AbstractEmbModel):
+    def __init__(self, embed_dim, n_classes=1000, add_sequence_dim=False):
+        super().__init__()
+        self.embedding = nn.Embedding(n_classes, embed_dim)
+        self.n_classes = n_classes
+        self.add_sequence_dim = add_sequence_dim
+
+    def forward(self, c):
+        c = self.embedding(c)
+        if self.add_sequence_dim:
+            c = c[:, None, :]
+        return c
+
+    def get_unconditional_conditioning(self, bs, device=&quot;cuda&quot;):
+        # 产生一个uc的张量，以字典的形式返回
+        uc_class = (
+            self.n_classes - 1
+        )  # 1000 classes --&gt; 0 ... 999, one extra class for ucg (class 1000)
+        uc = torch.ones((bs,), device=device) * uc_class
+        uc = {self.key: uc.long()}
+        return uc
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-Denoiser-2.3]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-denoiser-23/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-denoiser-23/">
+        </link>
+        <updated>2024-09-24T07:42:07.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="基于score-matching的-denoising">基于score matching的 denoising</h1>
+<p><img src="https://ShiMinghao0208.github.io/post-images/1727164577579.png" alt="" loading="lazy"><br>
+在DiffusionEngine中，我们初始化了denoiser，在loss和sample都会调用它，现在来看一下denosier大致做了什么。</p>
+<h2 id="denoiser">denoiser</h2>
+<p>文件在generative-models/sgm/modules/diffusionmodules/denoiser.py<br>
+代码很短，也确实没有什么可说的，跟截图公式基本对应。离散的去噪器实现感觉像是没写完的样子，看起来没有什么用，因为只是修改了sigma的来源，通过Discretization去生成sigma，但是本来的denoiser类接收的sigma就是通过Discretization生成的吧。</p>
+<pre><code class="language-python3">class Denoiser(nn.Module):
+    def __init__(self, scaling_config: Dict):
+        super().__init__()
+
+        self.scaling: DenoiserScaling = instantiate_from_config(scaling_config)
+
+    def possibly_quantize_sigma(self, sigma: torch.Tensor) -&gt; torch.Tensor:
+        return sigma
+
+    def possibly_quantize_c_noise(self, c_noise: torch.Tensor) -&gt; torch.Tensor:
+        return c_noise
+
+    def forward(
+        self,
+        network: nn.Module,
+        input: torch.Tensor,
+        sigma: torch.Tensor,
+        cond: Dict,
+        **additional_model_inputs,
+    ) -&gt; torch.Tensor:
+        sigma = self.possibly_quantize_sigma(sigma)
+        sigma_shape = sigma.shape
+        sigma = append_dims(sigma, input.ndim)
+        # 重点就在这里，对应论文公式的几个参数
+        c_skip, c_out, c_in, c_noise = self.scaling(sigma)
+        c_noise = self.possibly_quantize_c_noise(c_noise.reshape(sigma_shape))
+        # 这里return的结果就对应论文的公式
+        return (
+            network(input * c_in, c_noise, cond, **additional_model_inputs) * c_out
+            + input * c_skip
+        )
+</code></pre>
+<h2 id="denoiserscaling">DenoiserScaling</h2>
+<p>这个就是用来跟论文里表格进行匹配，生成对应的公式参数<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727166561725.png" alt="" loading="lazy"><br>
+注意sigma_data的值来自于配置文件，我看了mnist里面设置的就是1.0</p>
+<pre><code class="language-python3">class DenoiserScaling(ABC):
+    @abstractmethod
+    def __call__(
+        self, sigma: torch.Tensor
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pass
+
+
+class EDMScaling:
+    def __init__(self, sigma_data: float = 0.5):
+        self.sigma_data = sigma_data
+
+    def __call__(
+        self, sigma: torch.Tensor
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
+        c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
+        c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
+        c_noise = 0.25 * sigma.log()
+        return c_skip, c_out, c_in, c_noise
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-训练(pytorch lightning)-2.2 ]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-22/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-22/">
+        </link>
+        <updated>2024-09-20T08:59:39.000Z</updated>
+        <content type="html"><![CDATA[<p><a href="https://shiminghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-21/">上一节</a>给PL开了个头，简单讲了一下PL构建一整套模型及训练系统需要写什么，这篇文章继续。<br>
+起始参考代码还是generative-models/blob/main/main.py，见662行model = instantiate_from_config(config.model)结合上一节解析的SDXL是如何动态导入模块的，那么这里我们可以直接去配置文件看看它到底是怎么进行model的构造的。</p>
+<h1 id="model">Model</h1>
+<p>还是以generative-models/configs/example_training/toy/mnist_cond.yaml配置文件作为参考，发现model构造来自于sgm.models.diffusion.DiffusionEngine方法。</p>
+<h2 id="diffusionengine">DiffusionEngine</h2>
+<p>通过配置文件是多层target嵌套可以知道DiffusionEngine是由多个module组合init的，参考init代码也可以得知由以下几个模块组成：<br>
+1.network<br>
+2.denoiser<br>
+3.sampler<br>
+4.loss_fn<br>
+5.conditioner</p>
+<pre><code class="language-python3">class DiffusionEngine(pl.LightningModule):
+    def __init__(
+        self,
+        network_config,
+        denoiser_config,
+        first_stage_config,
+        conditioner_config: Union[None, Dict, ListConfig, OmegaConf] = None,
+        sampler_config: Union[None, Dict, ListConfig, OmegaConf] = None,
+        optimizer_config: Union[None, Dict, ListConfig, OmegaConf] = None,
+        scheduler_config: Union[None, Dict, ListConfig, OmegaConf] = None,
+        loss_fn_config: Union[None, Dict, ListConfig, OmegaConf] = None,
+        network_wrapper: Union[None, str] = None,
+        ckpt_path: Union[None, str] = None,
+        use_ema: bool = False,
+        ema_decay_rate: float = 0.9999,
+        scale_factor: float = 1.0,
+        disable_first_stage_autocast=False,
+        input_key: str = &quot;jpg&quot;,
+        log_keys: Union[List, None] = None,
+        no_cond_log: bool = False,
+        compile_model: bool = False,
+        en_and_decode_n_samples_a_time: Optional[int] = None,
+    ):
+        super().__init__()
+        self.log_keys = log_keys
+        self.input_key = input_key
+        self.optimizer_config = default(
+            optimizer_config, {&quot;target&quot;: &quot;torch.optim.AdamW&quot;}
+        )
+        model = instantiate_from_config(network_config)
+        self.model = get_obj_from_str(default(network_wrapper, OPENAIUNETWRAPPER))(
+            model, compile_model=compile_model
+        )
+
+        self.denoiser = instantiate_from_config(denoiser_config)
+        self.sampler = (
+            instantiate_from_config(sampler_config)
+            if sampler_config is not None
+            else None
+        )
+        self.conditioner = instantiate_from_config(
+            default(conditioner_config, UNCONDITIONAL_CONFIG)
+        )
+        self.scheduler_config = scheduler_config
+        self._init_first_stage(first_stage_config)
+
+        self.loss_fn = (
+            instantiate_from_config(loss_fn_config)
+            if loss_fn_config is not None
+            else None
+        )
+
+        self.use_ema = use_ema
+        if self.use_ema:
+            self.model_ema = LitEma(self.model, decay=ema_decay_rate)
+            print(f&quot;Keeping EMAs of {len(list(self.model_ema.buffers()))}.&quot;)
+
+        self.scale_factor = scale_factor
+        self.disable_first_stage_autocast = disable_first_stage_autocast
+        self.no_cond_log = no_cond_log
+
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path)
+
+        self.en_and_decode_n_samples_a_time = en_and_decode_n_samples_a_time
+</code></pre>
+<p>整个model其实对应着DiffusionEngine，而DiffusionEngine里面初始化的model(network_config)更符合我们以往对于model的定义，对应配置文件也就是sgm.modules.diffusionmodules.openaimodel.UNetModel，后续再分步阅读。</p>
+<h3 id="_init_first_stage">_init_first_stage</h3>
+<p>DiffusionEngine会有一个init_first_stage的方法，用于直接copy一个network.eval且固定其权重，因为有些part是不需要训练的，比如vae的解码编码、clip等等。</p>
+<pre><code class="language-python3">    def _init_first_stage(self, config):
+        model = instantiate_from_config(config).eval()
+        model.train = disabled_train
+        for param in model.parameters():
+            param.requires_grad = False
+        self.first_stage_model = model
+</code></pre>
+<p>譬如后面的encode、decode就是调用first_stage_model</p>
+<pre><code class="language-python3">    @torch.no_grad()
+    def encode_first_stage(self, x):
+        n_samples = default(self.en_and_decode_n_samples_a_time, x.shape[0])
+        n_rounds = math.ceil(x.shape[0] / n_samples)
+        all_out = []
+        with torch.autocast(&quot;cuda&quot;, enabled=not self.disable_first_stage_autocast):
+            for n in range(n_rounds):
+                out = self.first_stage_model.encode(
+                    x[n * n_samples : (n + 1) * n_samples]
+                )
+                all_out.append(out)
+        z = torch.cat(all_out, dim=0)
+        z = self.scale_factor * z
+        return z
+
+    @torch.no_grad()
+    def decode_first_stage(self, z):
+        z = 1.0 / self.scale_factor * z
+        n_samples = default(self.en_and_decode_n_samples_a_time, z.shape[0])
+
+        n_rounds = math.ceil(z.shape[0] / n_samples)
+        all_out = []
+        with torch.autocast(&quot;cuda&quot;, enabled=not self.disable_first_stage_autocast):
+            for n in range(n_rounds):
+                if isinstance(self.first_stage_model.decoder, VideoDecoder):
+                    kwargs = {&quot;timesteps&quot;: len(z[n * n_samples : (n + 1) * n_samples])}
+                else:
+                    kwargs = {}
+                out = self.first_stage_model.decode(
+                    z[n * n_samples : (n + 1) * n_samples], **kwargs
+                )
+                all_out.append(out)
+        out = torch.cat(all_out, dim=0)
+        return out
+</code></pre>
+<h3 id="forward">forward</h3>
+<p>forward函数与pytorch不同点在于，它将计算loss的过程放在了forward里面，因此具体要看loss_fn是怎么写的。</p>
+<pre><code class="language-python3">    def forward(self, x, batch):
+        loss = self.loss_fn(self.model, self.denoiser, self.conditioner, x, batch)
+        loss_mean = loss.mean()
+        loss_dict = {&quot;loss&quot;: loss_mean}
+        return loss_mean, loss_dict
+</code></pre>
+<h3 id="train">train</h3>
+<p>self.input_key是字符串变量，表示图片数据的格式，默认值是&quot;jpg&quot;，这里batch参数还不确定是什么，可能要具体看数据集是怎么构造的。</p>
+<pre><code class="language-python3">    def get_input(self, batch):
+        # assuming unified data format, dataloader returns a dict.
+        # image tensors should be scaled to -1 ... 1 and in bchw format
+        return batch[self.input_key]
+</code></pre>
+<p><strong>share step</strong><br>
+真正的训练step，首先通过get_input对输入做处理，然后对input进行encode操作到潜在空间，然后调用forward函数进行前向推理。</p>
+<pre><code class="language-python3">    def shared_step(self, batch: Dict) -&gt; Any:
+        x = self.get_input(batch)
+        x = self.encode_first_stage(x)
+        # global_step 是 PyTorch Lightning 中的一个属性，用于跟踪训练过程中的全局步数。它表示从训练开始到当前已经完成的优化步骤的总数。
+        # global_step 是一个自动维护的计数器，通常用于记录和监控训练过程中的指标，尤其是在日志记录和学习率调度等场景中。
+        batch[&quot;global_step&quot;] = self.global_step
+        loss, loss_dict = self(x, batch)
+        return loss, loss_dict
+</code></pre>
+<p>training_step核心就是调用了share_step，其余部分基本上就是在记录log</p>
+<pre><code class="language-python3">    def training_step(self, batch, batch_idx):
+        loss, loss_dict = self.shared_step(batch)
+
+        self.log_dict(
+            loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=False
+        )
+
+        self.log(
+            &quot;global_step&quot;,
+            self.global_step,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+        )
+
+        if self.scheduler_config is not None:
+            lr = self.optimizers().param_groups[0][&quot;lr&quot;]
+            self.log(
+                &quot;lr_abs&quot;, lr, prog_bar=True, logger=True, on_step=True, on_epoch=False
+            )
+
+        return loss
+</code></pre>
+<h3 id="configure_optimizers">configure_optimizers</h3>
+<p>在前面的训练流程里面出现了self.optimizers()，对应的就是训练过程的优化器，优化器的配置对应的就是configure_optimizers。<br>
+configure_optimizers 方法在训练开始前和从检查点恢复训练时被 PyTorch Lightning 自动调用。它用于初始化优化器和学习率调度器，以便在训练过程中正确地更新模型参数和调整学习率。通过这种机制，Lightning 框架能够简化优化器和调度器的管理，使得训练过程更加高效和便捷。</p>
+<pre><code class="language-python3">    def configure_optimizers(self):
+        lr = self.learning_rate
+        params = list(self.model.parameters())
+        for embedder in self.conditioner.embedders:
+            if embedder.is_trainable:
+                params = params + list(embedder.parameters())
+        opt = self.instantiate_optimizer_from_config(params, lr, self.optimizer_config)
+        if self.scheduler_config is not None:
+            scheduler = instantiate_from_config(self.scheduler_config)
+            print(&quot;Setting up LambdaLR scheduler...&quot;)
+            # LambdaLR通过用户定义的规则、函数来动态调整学习率
+            scheduler = [
+                {
+                    &quot;scheduler&quot;: LambdaLR(opt, lr_lambda=scheduler.schedule),
+                    &quot;interval&quot;: &quot;step&quot;,
+                    &quot;frequency&quot;: 1,
+                }
+            ]
+            return [opt], scheduler
+        return opt
+</code></pre>
+<h3 id="sample">Sample</h3>
+<p>主要就是调用denosier和sampler</p>
+<pre><code class="language-python3">    @torch.no_grad()
+    def sample(
+        self,
+        cond: Dict,
+        uc: Union[Dict, None] = None,
+        batch_size: int = 16,
+        shape: Union[None, Tuple, List] = None,
+        **kwargs,
+    ):
+        randn = torch.randn(batch_size, *shape).to(self.device)
+
+        denoiser = lambda input, sigma, c: self.denoiser(
+            self.model, input, sigma, c, **kwargs
+        )
+        samples = self.sampler(denoiser, randn, cond, uc=uc)
+        return samples
+</code></pre>
+<h3 id="log_conditionings">log_conditionings</h3>
+<p>这个函数我理解就是将各种各样的条件输入转换为一种img_size的张量并记录log</p>
+<pre><code class="language-python3">    @torch.no_grad()
+    def log_conditionings(self, batch: Dict, n: int) -&gt; Dict:
+        &quot;&quot;&quot;
+        Defines heuristics to log different conditionings.
+        These can be lists of strings (text-to-image), tensors, ints, ...
+        &quot;&quot;&quot;
+        image_h, image_w = batch[self.input_key].shape[2:]
+        log = dict()
+
+        for embedder in self.conditioner.embedders:
+            if (
+                (self.log_keys is None) or (embedder.input_key in self.log_keys)
+            ) and not self.no_cond_log:
+                x = batch[embedder.input_key][:n]
+                if isinstance(x, torch.Tensor):
+                    if x.dim() == 1:
+                        # class-conditional, convert integer to string
+                        x = [str(x[i].item()) for i in range(x.shape[0])]
+                        xc = log_txt_as_img((image_h, image_w), x, size=image_h // 4)
+                    elif x.dim() == 2:
+                        # size and crop cond and the like
+                        x = [
+                            &quot;x&quot;.join([str(xx) for xx in x[i].tolist()])
+                            for i in range(x.shape[0])
+                        ]
+                        xc = log_txt_as_img((image_h, image_w), x, size=image_h // 20)
+                    else:
+                        raise NotImplementedError()
+                elif isinstance(x, (List, ListConfig)):
+                    if isinstance(x[0], str):
+                        # strings
+                        xc = log_txt_as_img((image_h, image_w), x, size=image_h // 20)
+                    else:
+                        raise NotImplementedError()
+                else:
+                    raise NotImplementedError()
+                log[embedder.input_key] = xc
+        return log
+</code></pre>
+<p>核心就是判断x到底是什么类型的数据后，来调用log_txt_as_img</p>
+<pre><code class="language-python3">def log_txt_as_img(wh, xc, size=10):
+    # wh a tuple of (width, height)
+    # xc a list of captions to plot
+    b = len(xc)
+    txts = list()
+    for bi in range(b):
+        txt = Image.new(&quot;RGB&quot;, wh, color=&quot;white&quot;) # 白色背景新图像
+        draw = ImageDraw.Draw(txt) # 创建为一个绘图对象
+        font = ImageFont.truetype(&quot;data/DejaVuSans.ttf&quot;, size=size) # 指定字体
+        nc = int(40 * (wh[0] / 256))
+        if isinstance(xc[bi], list):
+            text_seq = xc[bi][0]
+        else:
+            text_seq = xc[bi]
+        lines = &quot;\n&quot;.join(
+            text_seq[start : start + nc] for start in range(0, len(text_seq), nc)
+        )
+        
+        # 在图上把字体画出来
+        try:
+            draw.text((0, 0), lines, fill=&quot;black&quot;, font=font)
+        except UnicodeEncodeError:
+            print(&quot;Cant encode string for logging. Skipping.&quot;)
+
+        txt = np.array(txt).transpose(2, 0, 1) / 127.5 - 1.0
+        txts.append(txt)
+    # 返回一个tensor格式的张量
+    txts = np.stack(txts)
+    txts = torch.tensor(txts)
+    return txts
+</code></pre>
+<h3 id="log_images">log_images</h3>
+<p>这个函数也是记录输入图像到log里面，比如记录了encode前是什么图像信息、直接decode又是什么图像信息，如果sample就再记录sample+decode后的信息。</p>
+<pre><code class="language-python3">    @torch.no_grad()
+    def log_images(
+        self,
+        batch: Dict,
+        N: int = 8,
+        sample: bool = True,
+        ucg_keys: List[str] = None,
+        **kwargs,
+    ) -&gt; Dict:
+        # 从embedder层获取key
+        conditioner_input_keys = [e.input_key for e in self.conditioner.embedders]
+        # 确定无条件生成的key(如果有)在前面获取的key里面
+        if ucg_keys:
+            assert all(map(lambda x: x in conditioner_input_keys, ucg_keys)), (
+                &quot;Each defined ucg key for sampling must be in the provided conditioner input keys,&quot;
+                f&quot;but we have {ucg_keys} vs. {conditioner_input_keys}&quot;
+            )
+        else:
+            ucg_keys = conditioner_input_keys
+        log = dict()
+
+        x = self.get_input(batch)
+
+        # 获取条件和无条件向量嵌入
+        c, uc = self.conditioner.get_unconditional_conditioning(
+            batch,
+            force_uc_zero_embeddings=ucg_keys
+            if len(self.conditioner.embedders) &gt; 0
+            else [],
+        )
+
+        sampling_kwargs = {}
+
+        N = min(x.shape[0], N)
+        x = x.to(self.device)[:N]
+        log[&quot;inputs&quot;] = x
+        z = self.encode_first_stage(x) # 对输入图像进行编码
+        log[&quot;reconstructions&quot;] = self.decode_first_stage(z) # 记录解码图像
+        log.update(self.log_conditionings(batch, N)) # 更新日志(条件信息)
+        
+        # 将条件向量转换到合适的device
+        for k in c:
+            if isinstance(c[k], torch.Tensor):
+                c[k], uc[k] = map(lambda y: y[k][:N].to(self.device), (c, uc))
+        
+        # 如果sample就采样生成结果并记录到log里面
+        if sample:
+            with self.ema_scope(&quot;Plotting&quot;):
+                samples = self.sample(
+                    c, shape=z.shape[1:], uc=uc, batch_size=N, **sampling_kwargs
+                )
+            samples = self.decode_first_stage(samples)
+            log[&quot;samples&quot;] = samples
+        return log
+</code></pre>
+<h3 id="model-ema">model EMA</h3>
+<p>在DiffusionEngine初始化的时候还进行了ema初始化操作：</p>
+<pre><code class="language-python3">if self.use_ema:
+            self.model_ema = LitEma(self.model, decay=ema_decay_rate)
+            print(f&quot;Keeping EMAs of {len(list(self.model_ema.buffers()))}.&quot;)
+</code></pre>
+<p>且还有一个上下文方法，ema_scope用于加载模型的ema参数</p>
+<pre><code class="language-python3">    @contextmanager
+    def ema_scope(self, context=None):
+        if self.use_ema:
+            self.model_ema.store(self.model.parameters())
+            self.model_ema.copy_to(self.model)
+            if context is not None:
+                print(f&quot;{context}: Switched to EMA weights&quot;)
+        try:
+            yield None
+        finally:
+            if self.use_ema:
+                self.model_ema.restore(self.model.parameters())
+                if context is not None:
+                    print(f&quot;{context}: Restored training weights&quot;)
+</code></pre>
+<p>所以我们需要了解一下EMA是什么，有什么作用。</p>
+<h4 id="ema-移动指数平均">EMA 移动指数平均</h4>
+<p>指数移动平均（Exponential Moving Average, EMA）是一种常用的技巧，可以帮助模型在训练过程中更稳定，通常用于提高模型的泛化能力和性能。<br>
+这种技术在深度学习中被广泛应用，主要有以下几个原因:</p>
+<p>1.降低噪声和波动<br>
+在模型训练过程中，尤其是在使用随机梯度下降（SGD）或其变种时，参数更新可能会受到噪声和波动的影响。这些噪声和波动可能来自于小批量数据的不稳定性或学习率的变化。EMA 通过对参数进行加权平均，可以平滑掉这些噪声和波动，使得模型参数更加稳定。</p>
+<p>2.缓解过拟合<br>
+EMA 可以看作是一种正则化技术。通过对参数进行加权平均，EMA 可以抑制参数的过度波动，从而减少过拟合的风险。特别是在训练后期，EMA 可以帮助模型更好地泛化到未见过的数据。</p>
+<p>3.提高模型的泛化能力<br>
+由于 EMA 在一定程度上平滑了参数更新，它可以帮助模型更好地捕捉数据的总体趋势，而不是过度拟合到训练数据中的细节。这种平滑效应可以提高模型在测试集上的性能，从而提高模型的泛化能力。</p>
+<p>4.减少参数的极端值<br>
+EMA 可以防止参数出现极端值。极端值可能会导致模型的不稳定性和性能下降。通过对参数进行加权平均，EMA 可以减缓参数的剧烈变化，使得参数更加平滑和稳定。<br>
+（来自于chatgpt）</p>
+<p>我的理解就是有点类似于集成模型的原理，集成了训练以来所有轮参数模型的一个结果，移动平均就是对所有模型输出结果的一个处理。<br>
+公式就是<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>e</mi><mi>m</mi><msub><mi>a</mi><mi>w</mi></msub><mi mathvariant="normal">​</mi><mo>=</mo><mi>d</mi><mi>e</mi><mi>c</mi><mi>a</mi><mi>y</mi><mo>⋅</mo><mi>e</mi><mi>m</mi><msub><mi>a</mi><mi>w</mi></msub><mi mathvariant="normal">​</mi><mo>+</mo><mo>(</mo><mn>1</mn><mi mathvariant="normal">−</mi><mi>d</mi><mi>e</mi><mi>c</mi><mi>a</mi><mi>y</mi><mo>)</mo><mo>⋅</mo><mi>w</mi></mrow><annotation encoding="application/x-tex">ema_w​=decay⋅ema_w​+(1−decay)⋅w</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">m</span><span class="mord"><span class="mord mathdefault">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.151392em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right:0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">​</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.8888799999999999em;vertical-align:-0.19444em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">e</span><span class="mord mathdefault">c</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right:0.03588em;">y</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.73333em;vertical-align:-0.15em;"></span><span class="mord mathdefault">e</span><span class="mord mathdefault">m</span><span class="mord"><span class="mord mathdefault">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.151392em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight" style="margin-right:0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">​</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mord">−</span><span class="mord mathdefault">d</span><span class="mord mathdefault">e</span><span class="mord mathdefault">c</span><span class="mord mathdefault">a</span><span class="mord mathdefault" style="margin-right:0.03588em;">y</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.02691em;">w</span></span></span></span><br>
+对应到源文件generative-models/sgm/modules/ema.py</p>
+<pre><code class="language-python3">import torch
+from torch import nn
+
+
+class LitEma(nn.Module):
+    def __init__(self, model, decay=0.9999, use_num_upates=True):
+        super().__init__()
+        if decay &lt; 0.0 or decay &gt; 1.0:
+            raise ValueError(&quot;Decay must be between 0 and 1&quot;)
+
+        self.m_name2s_name = {}
+        
+        # 为decay和num_updates注册buffer
+        self.register_buffer(&quot;decay&quot;, torch.tensor(decay, dtype=torch.float32))
+        self.register_buffer(
+            &quot;num_updates&quot;,
+            torch.tensor(0, dtype=torch.int)
+            if use_num_upates
+            else torch.tensor(-1, dtype=torch.int),
+        )
+
+        # 遍历原模型的可训练参数，为每个参数对应创建一个ema参数并注册buffer
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                # remove as '.'-character is not allowed in buffers
+                s_name = name.replace(&quot;.&quot;, &quot;&quot;)
+                self.m_name2s_name.update({name: s_name})
+                self.register_buffer(s_name, p.clone().detach().data)
+
+        self.collected_params = []
+
+    def reset_num_updates(self):
+        # 重置num_updates
+        del self.num_updates
+        self.register_buffer(&quot;num_updates&quot;, torch.tensor(0, dtype=torch.int))
+
+    def forward(self, model):
+        decay = self.decay
+
+        if self.num_updates &gt;= 0:
+            self.num_updates += 1
+            decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+
+        one_minus_decay = 1.0 - decay
+
+        with torch.no_grad():
+            # m_param是原模型的参数
+            # shadow_params是ema模型的参数
+            m_param = dict(model.named_parameters())
+            shadow_params = dict(self.named_buffers())
+
+            for key in m_param:
+                if m_param[key].requires_grad:
+                    sname = self.m_name2s_name[key]
+                    shadow_params[sname] = shadow_params[sname].type_as(m_param[key])
+                    # ema_w = ema_w - (1 - decay)(ema_w - w)
+                    #       = decay*ema_w + (1 - decay)*w
+                    shadow_params[sname].sub_(
+                        one_minus_decay * (shadow_params[sname] - m_param[key])
+                    )
+                else:
+                    assert not key in self.m_name2s_name
+
+    def copy_to(self, model):
+        # 把ema参数复制到模型参数
+        m_param = dict(model.named_parameters())
+        shadow_params = dict(self.named_buffers())
+        for key in m_param:
+            if m_param[key].requires_grad:
+                m_param[key].data.copy_(shadow_params[self.m_name2s_name[key]].data)
+            else:
+                assert not key in self.m_name2s_name
+
+    # 存储和重新载入模型参数
+    def store(self, parameters):
+        &quot;&quot;&quot;
+        Save the current parameters for restoring later.
+        Args:
+          parameters: Iterable of `torch.nn.Parameter`; the parameters to be
+            temporarily stored.
+        &quot;&quot;&quot;
+        self.collected_params = [param.clone() for param in parameters]
+
+    def restore(self, parameters):
+        &quot;&quot;&quot;
+        Restore the parameters stored with the `store` method.
+        Useful to validate the model with EMA parameters without affecting the
+        original optimization process. Store the parameters before the
+        `copy_to` method. After validation (or model saving), use this to
+        restore the former parameters.
+        Args:
+          parameters: Iterable of `torch.nn.Parameter`; the parameters to be
+            updated with the stored parameters.
+        &quot;&quot;&quot;
+        for c_param, param in zip(self.collected_params, parameters):
+            param.data.copy_(c_param.data)
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-训练(pytorch lightning)-2.1]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-21/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-21/">
+        </link>
+        <updated>2024-09-20T03:04:46.000Z</updated>
+        <content type="html"><![CDATA[<p>SDXL是使用PL(pytorch lightning)进行训练的，其实PL与pytorch在写法上区别不算很大，只不过pytorch需要构造模型，然后零散的去写train、loss、optimizer等。PL构建的不是一个模型，而是基于一个模型的一套系统，这套系统包含该模型的train、loss等等，PL实际就是对pytorch的方法的封装和简化，让模型构建、训练、测试整套流程代码简洁易懂。<br>
+对应的，我们可以通过SDXL代码阅读顺便来学习一下pytorch lightning，因此代码对应pytorch从几个方面分开记录：<br>
+1.数据集构造<br>
+2.模型构造<br>
+3.Loss与Optimizer构造<br>
+4.训练step和测试<br>
+5.log(optional)</p>
+<p>学习的代码参考generative-models/blob/main/main.py</p>
+<h1 id="sdxl-模块导入">SDXL 模块导入</h1>
+<p>在记录之前，首先需要了解一下SDXL是如何进行模块的搭建的，通过这种方法我们可以编辑配置文件的内容来按需引入module中的方法，并给予其想要的参数。</p>
+<p>举个例子：搭建模型的时候我希望引入一个attention模块里的SE-attn方法来构建网络，并给予参数1、参数2初始化。过了几天我可能又发现另一个可以尝试的attn比如self-attn，那么我只需要在attention模块里写好self-attn，在配置文件里编辑好self-attn及对应的参数，就不需要再修改我的model构建文件，每次去更换import各种方法。</p>
+<p>当然，可以直接通过import *的方式去导入所有的方法，但我觉得配置文件的方式更加清晰明了，并且通过配置文件就可以一目了然的看到这次搭建的model里面具体用了哪些module、function，而不用具体看代码。</p>
+<h2 id="配置文件写法">配置文件写法</h2>
+<p>参考的配置文件路径在generative-models/configs/example_training/toy/mnist_cond.yaml<br>
+简单的来说，target字段就是想要import的模块、方法，对应params就是初始化该方法的参数。</p>
+<pre><code class="language-yaml">model:
+  base_learning_rate: 1.0e-4
+  target: sgm.models.diffusion.DiffusionEngine
+  params:
+    denoiser_config:
+      target: sgm.modules.diffusionmodules.denoiser.Denoiser
+      params:
+        scaling_config:
+          target: sgm.modules.diffusionmodules.denoiser_scaling.EDMScaling
+          params:
+            sigma_data: 1.0
+
+    network_config:
+      target: sgm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        in_channels: 1
+        out_channels: 1
+        model_channels: 32
+        attention_resolutions: []
+        num_res_blocks: 4
+        channel_mult: [1, 2, 2]
+        num_head_channels: 32
+        num_classes: sequential
+        adm_in_channels: 128
+
+    conditioner_config:
+      target: sgm.modules.GeneralConditioner
+      params:
+        emb_models:
+          - is_trainable: True
+            input_key: cls
+            ucg_rate: 0.2
+            target: sgm.modules.encoders.modules.ClassEmbedder
+            params:
+              embed_dim: 128
+              n_classes: 10
+
+    first_stage_config:
+      target: sgm.models.autoencoder.IdentityFirstStage
+
+    loss_fn_config:
+      target: sgm.modules.diffusionmodules.loss.StandardDiffusionLoss
+      params:
+        loss_weighting_config:
+          target: sgm.modules.diffusionmodules.loss_weighting.EDMWeighting
+          params:
+            sigma_data: 1.0
+        sigma_sampler_config:
+          target: sgm.modules.diffusionmodules.sigma_sampling.EDMSampling
+
+    sampler_config:
+      target: sgm.modules.diffusionmodules.sampling.EulerEDMSampler
+      params:
+        num_steps: 50
+
+        discretization_config:
+          target: sgm.modules.diffusionmodules.discretizer.EDMDiscretization
+
+        guider_config:
+          target: sgm.modules.diffusionmodules.guiders.VanillaCFG
+          params:
+            scale: 3.0
+
+data:
+  target: sgm.data.mnist.MNISTLoader
+  params:
+    batch_size: 512
+    num_workers: 1
+
+lightning:
+  modelcheckpoint:
+    params:
+      every_n_train_steps: 5000
+
+  callbacks:
+    metrics_over_trainsteps_checkpoint:
+      params:
+        every_n_train_steps: 25000
+
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: False
+        batch_frequency: 1000
+        max_images: 16
+        increase_log_steps: True
+        log_first_step: False
+        log_images_kwargs:
+          use_ema_scope: False
+          N: 16
+          n_rows: 4
+
+  trainer:
+    devices: 0,
+    benchmark: True
+    num_sanity_val_steps: 0
+    accumulate_grad_batches: 1
+    max_epochs: 20
+</code></pre>
+<h2 id="instantiate_from_config">instantiate_from_config</h2>
+<p>该函数用于解析配置文件，就是确定一下要有target参数。<br>
+main.py到处都有这个函数，包括之前讲采样过程也是。</p>
+<pre><code class="language-python3">def instantiate_from_config(config):
+    if not &quot;target&quot; in config:
+        if config == &quot;__is_first_stage__&quot;:
+            return None
+        elif config == &quot;__is_unconditional__&quot;:
+            return None
+        raise KeyError(&quot;Expected key `target` to instantiate.&quot;)
+    # print(&quot;--------------------------------------&quot;)
+    # print(config)
+    # print(**config)
+    return get_obj_from_str(config[&quot;target&quot;])(**config.get(&quot;params&quot;, dict()))
+</code></pre>
+<h2 id="get_obj_from_str">get_obj_from_str</h2>
+<p>从字符串中去import module里面的class方法</p>
+<pre><code class="language-python3">def get_obj_from_str(string, reload=False, invalidate_cache=True):
+    # rsplit方法分割字符串一次，获得module和class名称
+    module, cls = string.rsplit(&quot;.&quot;, 1)
+    # 调用 importlib.invalidate_caches()，使导入系统的缓存失效。这在文件系统发生变化时可能会有用。
+    if invalidate_cache:
+        importlib.invalidate_caches()
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp) # 重新加载模块，确保获取最新版本。
+    
+    # 使用 importlib.import_module(module_path) 导入一个模块时，Python 会将模块加载为一个对象。
+    # 这个模块对象的属性包括模块中定义的所有内容，比如类、函数、和变量。
+    # getattr从模块对象中获取名为 cls 的属性。
+    return getattr(importlib.import_module(module, package=None), cls)
+</code></pre>
+<p>实际上调用instantiate_from_config就是通过该方法完成了一个module.class(params)的初始化过程。</p>
+<h1 id="pytorchlightning-构造">PytorchLightning 构造</h1>
+<h2 id="dataloader构建">dataloader构建</h2>
+<p>其实dataloader构建可以按照pytorch的dataset、dataloader类来构建，也可以用LightningDataModule来构建。虽然 LightningDataModule 没有严格的“必须”实现的方法，但为了充分利用其功能，通常会实现下述几个方法：prepare_data、setup、train_dataloader、val_dataloader、test_dataloader。<br>
+下面会主要讲一下SDXL用LightningDataModule来构造dataloader。</p>
+<h3 id="mnist数据">MNIST数据</h3>
+<p>本质上还是用的pytorch的dataloader，但还是实现了PL需要的一些方法</p>
+<pre><code class="language-python3">import pytorch_lightning as pl
+import torchvision
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
+
+class MNISTDataDictWrapper(Dataset):
+    def __init__(self, dset):
+        super().__init__()
+        self.dset = dset
+
+    def __getitem__(self, i):
+        x, y = self.dset[i]
+        return {&quot;jpg&quot;: x, &quot;cls&quot;: y}
+
+    def __len__(self):
+        return len(self.dset)
+
+
+class MNISTLoader(pl.LightningDataModule):
+    def __init__(self, batch_size, num_workers=0, prefetch_factor=2, shuffle=True):
+        super().__init__()
+
+        transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Lambda(lambda x: x * 2.0 - 1.0)]
+        )
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor if num_workers &gt; 0 else 0
+        self.shuffle = shuffle
+        self.train_dataset = MNISTDataDictWrapper(
+            torchvision.datasets.MNIST(
+                root=&quot;.data/&quot;, train=True, download=True, transform=transform
+            )
+        )
+        self.test_dataset = MNISTDataDictWrapper(
+            torchvision.datasets.MNIST(
+                root=&quot;.data/&quot;, train=False, download=True, transform=transform
+            )
+        )
+
+    def prepare_data(self):
+        pass
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
+        )
+</code></pre>
+<h3 id="custom-dataset">custom dataset</h3>
+<p>他们自己写了个sdata的库来create dataset或者dataloader，但dataloader最终的本质还是pytorch的dataloader，所以简单看一下继承PL的模块还是实现那些方法就行了</p>
+<pre><code class="language-python3">from typing import Optional
+
+import torchdata.datapipes.iter
+import webdataset as wds
+from omegaconf import DictConfig
+from pytorch_lightning import LightningDataModule
+
+try:
+    from sdata import create_dataset, create_dummy_dataset, create_loader
+except ImportError as e:
+    print(&quot;#&quot; * 100)
+    print(&quot;Datasets not yet available&quot;)
+    print(&quot;to enable, we need to add stable-datasets as a submodule&quot;)
+    print(&quot;please use ``git submodule update --init --recursive``&quot;)
+    print(&quot;and do ``pip install -e stable-datasets/`` from the root of this repo&quot;)
+    print(&quot;#&quot; * 100)
+    exit(1)
+
+
+class StableDataModuleFromConfig(LightningDataModule):
+    def __init__(
+        self,
+        train: DictConfig,
+        validation: Optional[DictConfig] = None,
+        test: Optional[DictConfig] = None,
+        skip_val_loader: bool = False,
+        dummy: bool = False,
+    ):
+        super().__init__()
+        self.train_config = train
+        assert (
+            &quot;datapipeline&quot; in self.train_config and &quot;loader&quot; in self.train_config
+        ), &quot;train config requires the fields `datapipeline` and `loader`&quot;
+
+        self.val_config = validation
+        if not skip_val_loader:
+            if self.val_config is not None:
+                assert (
+                    &quot;datapipeline&quot; in self.val_config and &quot;loader&quot; in self.val_config
+                ), &quot;validation config requires the fields `datapipeline` and `loader`&quot;
+            else:
+                print(
+                    &quot;Warning: No Validation datapipeline defined, using that one from training&quot;
+                )
+                self.val_config = train
+
+        self.test_config = test
+        if self.test_config is not None:
+            assert (
+                &quot;datapipeline&quot; in self.test_config and &quot;loader&quot; in self.test_config
+            ), &quot;test config requires the fields `datapipeline` and `loader`&quot;
+
+        self.dummy = dummy
+        if self.dummy:
+            print(&quot;#&quot; * 100)
+            print(&quot;USING DUMMY DATASET: HOPE YOU'RE DEBUGGING ;)&quot;)
+            print(&quot;#&quot; * 100)
+
+    def setup(self, stage: str) -&gt; None:
+        print(&quot;Preparing datasets&quot;)
+        if self.dummy:
+            data_fn = create_dummy_dataset
+        else:
+            data_fn = create_dataset
+
+        self.train_datapipeline = data_fn(**self.train_config.datapipeline)
+        if self.val_config:
+            self.val_datapipeline = data_fn(**self.val_config.datapipeline)
+        if self.test_config:
+            self.test_datapipeline = data_fn(**self.test_config.datapipeline)
+
+    def train_dataloader(self) -&gt; torchdata.datapipes.iter.IterDataPipe:
+        loader = create_loader(self.train_datapipeline, **self.train_config.loader)
+        return loader
+
+    def val_dataloader(self) -&gt; wds.DataPipeline:
+        return create_loader(self.val_datapipeline, **self.val_config.loader)
+
+    def test_dataloader(self) -&gt; wds.DataPipeline:
+        return create_loader(self.test_datapipeline, **self.test_config.loader)
+</code></pre>
+<p>区别是这里没有实现了prepare_data了，大概是sdata里面的datapipeline做了这件事情了。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-Sampler推理(EDM)-1.2]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-sampler-tui-li-12/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-sampler-tui-li-12/">
+        </link>
+        <updated>2024-09-18T08:53:25.000Z</updated>
+        <content type="html"><![CDATA[<p>本文紧接上一节的<a href="https://shiminghao0208.github.io/post/sdxl-dai-ma-yue-du-tui-li-11/#sampler">sampler</a>讲解采样器的第三个部分，采样器方法本身。</p>
+<h1 id="sampler">Sampler</h1>
+<p>主要的方法在BaseDiffusionSampler类中(init、denoise、prepare_sampling_loop)，会基于一些不同的采样方法有一些子类。</p>
+<h2 id="basediffusionsampler">BaseDiffusionSampler</h2>
+<pre><code class="language-python3"># 提供默认值的机制
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+class BaseDiffusionSampler:
+    def __init__(
+        self,
+        discretization,
+        guider,
+        num_steps: Union[int, None] = None,
+        verbose: bool = False,
+        device: str = &quot;cuda&quot;,
+    ):
+        self.num_steps = num_steps
+        self.discretization = discretization
+        self.guider = guider
+        self.verbose = verbose
+        self.device = device
+
+    def prepare_sampling_loop(self, x, cond, uc=None, num_steps=None):
+        '''
+            用于准备迭代采样的元素
+            x: 输入
+            cond: 条件输入
+            uc: 无条件输入，可能用于一些特殊的生成设置或对比实验。
+        '''
+        # 通过调度器生成噪声的标准差sigma
+        sigmas = self.discretization(
+            self.num_steps if num_steps is None else num_steps, device=self.device
+        )
+        uc = default(uc, cond)
+
+        x *= torch.sqrt(1.0 + sigmas[0] ** 2.0)
+        num_sigmas = len(sigmas)
+
+        # s_in 作为一个全 1 张量，通常用于对 sigma 进行缩放操作。在采样过程中，s_in 与 sigma 相乘，确保 sigma 在批次维度上正确广播。
+        # 在采样步骤中，s_in 确保了每一步的 sigma 值可以正确地应用于整个批次的输入张量 x。(来自于chatgpt)
+        s_in = x.new_ones([x.shape[0]])
+
+        return x, s_in, sigmas, num_sigmas, cond, uc
+
+    def denoise(self, x, denoiser, sigma, cond, uc):
+        '''
+            用guider指导消噪的过程
+        '''
+        denoised = denoiser(*self.guider.prepare_inputs(x, sigma, cond, uc))
+        denoised = self.guider(denoised, sigma)
+        return denoised
+
+    def get_sigma_gen(self, num_sigmas):
+        sigma_generator = range(num_sigmas - 1)
+        if self.verbose:
+            print(&quot;#&quot; * 30, &quot; Sampling setting &quot;, &quot;#&quot; * 30)
+            print(f&quot;Sampler: {self.__class__.__name__}&quot;)
+            print(f&quot;Discretization: {self.discretization.__class__.__name__}&quot;)
+            print(f&quot;Guider: {self.guider.__class__.__name__}&quot;)
+            sigma_generator = tqdm(
+                sigma_generator,
+                total=num_sigmas,
+                desc=f&quot;Sampling with {self.__class__.__name__} for {num_sigmas} steps&quot;,
+            )
+        return sigma_generator
+</code></pre>
+<h2 id="单步采样">单步采样</h2>
+<p>定义了两个方法，一个是sample_step，这个由具体子类实现；一个是euler_step，这个是欧拉法解ODE。<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726652554963.png" alt="" loading="lazy"></p>
+<pre><code class="language-python3">class SingleStepDiffusionSampler(BaseDiffusionSampler):
+    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc, *args, **kwargs):
+        raise NotImplementedError
+
+    def euler_step(self, x, d, dt):
+        return x + dt * d
+</code></pre>
+<h2 id="edm-sampler">EDM Sampler</h2>
+<p>在EDM Sampler中，最重要的方法就是sample_step。</p>
+<p class='katex-block'><span class="katex-display"><span class="katex"><span class="katex-mathml"><math><semantics><mrow><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mo>=</mo><mi>σ</mi><mo>×</mo><mo>(</mo><mi>γ</mi><mo>+</mo><mn>1</mn><mo>)</mo><mspace linebreak="newline"></mspace><mi>x</mi><mo>=</mo><mi>x</mi><mo>+</mo><mi>ϵ</mi><mo>×</mo><msqrt><msup><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mn>2</mn></msup></msqrt><mo separator="true">,</mo><mspace width="1em"/><mi>i</mi><mi>f</mi><mspace width="1em"/><mi>γ</mi><mo>&gt;</mo><mn>0</mn><mspace linebreak="newline"></mspace><msub><mi>μ</mi><mi>θ</mi></msub><mo>=</mo><mi>d</mi><mi>e</mi><mi>n</mi><mi>o</mi><mi>i</mi><mi>s</mi><mi>e</mi><mi>r</mi><mo>(</mo><mi>x</mi><mo separator="true">,</mo><mover accent="true"><mi>σ</mi><mo>^</mo></mover><mo separator="true">,</mo><mi>c</mi><mo separator="true">,</mo><mi>u</mi><mi>c</mi><mo>)</mo><mspace linebreak="newline"></mspace><mi>d</mi><mo>=</mo><mfrac><mrow><mi>x</mi><mo>−</mo><msub><mi>μ</mi><mi>θ</mi></msub></mrow><mover accent="true"><mi>σ</mi><mo>^</mo></mover></mfrac><mspace linebreak="newline"></mspace><mi>d</mi><mi>t</mi><mo>=</mo><msub><mi>σ</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo>−</mo><mover accent="true"><mi>σ</mi><mo>^</mo></mover><msub><mi>x</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo>=</mo><mi>x</mi><mo>+</mo><mi>d</mi><mo>×</mo><mi>d</mi><mi>t</mi></mrow><annotation encoding="application/x-tex">\hat\sigma = \sigma \times (\gamma + 1) \\
+x = x + \epsilon \times \sqrt{\hat\sigma^2} , \quad if \quad \gamma &gt; 0 \\
+\mu_{\theta} = denoiser(x, \hat\sigma, c, uc) \\
+d = \frac {x - \mu_{\theta}} {\hat\sigma} \\ 
+dt = \sigma_{next} - \hat\sigma
+x_{next} = x + d \times dt
+</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathdefault" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">ϵ</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1.198369em;vertical-align:-0.19444em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.003929em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.740108em;"><span style="top:-2.9890000000000003em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-2.9639290000000003em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg width='400em' height='1.08em' viewBox='0 0 400000 1080' preserveAspectRatio='xMinYMin slice'><path d='M95,702c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,
+-10,-9.5,-14c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54c44.2,-33.3,65.8,
+-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10s173,378,173,378c0.7,0,
+35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429c69,-144,104.5,-217.7,106.5,
+-221c5.3,-9.3,12,-14,20,-14H400000v40H845.2724s-225.272,467,-225.272,467
+s-235,486,-235,486c-2.7,4.7,-9,7,-19,7c-6,0,-10,-1,-12,-3s-194,-422,-194,-422
+s-65,47,-65,47z M834 80H400000v40H845z'/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.036070999999999964em;"><span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mspace" style="margin-right:1em;"></span><span class="mord mathdefault">i</span><span class="mord mathdefault" style="margin-right:0.10764em;">f</span><span class="mspace" style="margin-right:1em;"></span><span class="mord mathdefault" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.64444em;vertical-align:0em;"></span><span class="mord">0</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.33610799999999996em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right:0.02778em;">θ</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">e</span><span class="mord mathdefault">n</span><span class="mord mathdefault">o</span><span class="mord mathdefault">i</span><span class="mord mathdefault">s</span><span class="mord mathdefault">e</span><span class="mord mathdefault" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord mathdefault">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord mathdefault">c</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord mathdefault">u</span><span class="mord mathdefault">c</span><span class="mclose">)</span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:1.9463300000000001em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603300000000002em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mord"><span class="mord mathdefault">μ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.33610799999999996em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight" style="margin-right:0.02778em;">θ</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span><span class="mspace newline"></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">t</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.73333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">x</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.84444em;vertical-align:-0.15em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.69444em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">^</span></span></span></span></span></span><span class="mord"><span class="mord mathdefault">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">n</span><span class="mord mathdefault mtight">e</span><span class="mord mathdefault mtight">x</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.66666em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">x</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.77777em;vertical-align:-0.08333em;"></span><span class="mord mathdefault">d</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.69444em;vertical-align:0em;"></span><span class="mord mathdefault">d</span><span class="mord mathdefault">t</span></span></span></span></span></p>
+<p>在许多基于扩散模型的采样方法中，噪声标准差 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间的一个函数。例如，在某些扩散模型中，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间 t 的单调函数。通过这种方式，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 实际上隐含地编码了时间信息。因此，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 的变化量可以用来近似时间步长。</p>
+<p>具体来说，如果我们假设 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.43056em;vertical-align:0em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span></span></span></span> 是时间 t 的单调函数，那么 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi><mo>(</mo><mi>t</mi><mo>)</mo></mrow><annotation encoding="application/x-tex">\sigma(t)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mopen">(</span><span class="mord mathdefault">t</span><span class="mclose">)</span></span></span></span> 可以表示为 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，并且 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>σ</mi><mo>(</mo><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi><mo>)</mo></mrow><annotation encoding="application/x-tex">\sigma(t + Δt)</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="mopen">(</span><span class="mord mathdefault">t</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">Δ</span><span class="mord mathdefault">t</span><span class="mclose">)</span></span></span></span> 可以表示为 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mrow><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi></mrow></msub></mrow><annotation encoding="application/x-tex">\sigma_{t+Δt}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.638891em;vertical-align:-0.208331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328331em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">Δ</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.208331em;"><span></span></span></span></span></span></span></span></span></span>。因此，next_sigma - sigma_hat 实际上是 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mrow><mi>t</mi><mo>+</mo><mi mathvariant="normal">Δ</mi><mi>t</mi></mrow></msub><mo>−</mo><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_{t+Δt} - \sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.791661em;vertical-align:-0.208331em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328331em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">Δ</span><span class="mord mathdefault mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.208331em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，这可以用来近似时间步长 Δt。这种方法简化了时间步长的计算，同时保持了采样过程的稳定性。(来自于GPT)</p>
+<pre><code class="language-python3">class EDMSampler(SingleStepDiffusionSampler):
+    def __init__(
+        self, s_churn=0.0, s_tmin=0.0, s_tmax=float(&quot;inf&quot;), s_noise=1.0, *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.s_churn = s_churn
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
+
+    def sampler_step(self, sigma, next_sigma, denoiser, x, cond, uc=None, gamma=0.0):
+        &quot;&quot;&quot;
+            sigma: 当前步的噪声标准差
+            next_sigma: 下一步的噪声标准差
+            denoiser: 消噪器
+            x: 当前输入
+            cond: 条件输入
+            uc: 无条件输入
+            gamma: 调节参数, 用于给输入x增加一些随机噪声
+        &quot;&quot;&quot;
+        
+        # 计算调节后的sigma_hat
+        sigma_hat = sigma * (gamma + 1.0)
+        # 如果gamma &gt; 0, 也就是sigma受到了调节，就对输入x增加一些随机扰动
+        # x + eps * sigma_hat ** 0.5
+        if gamma &gt; 0:
+            eps = torch.randn_like(x) * self.s_noise
+            x = x + eps * append_dims(sigma_hat**2 - sigma**2, x.ndim) ** 0.5
+
+        denoised = self.denoise(x, denoiser, sigma_hat, cond, uc)
+        d = to_d(x, sigma_hat, denoised)
+        dt = append_dims(next_sigma - sigma_hat, x.ndim)
+
+        euler_step = self.euler_step(x, d, dt)
+        x = self.possible_correction_step(
+            euler_step, x, d, dt, next_sigma, denoiser, cond, uc
+        )
+        return x
+
+    def __call__(self, denoiser, x, cond, uc=None, num_steps=None):
+        x, s_in, sigmas, num_sigmas, cond, uc = self.prepare_sampling_loop(
+            x, cond, uc, num_steps
+        )
+        # 计算gamma的值
+        for i in self.get_sigma_gen(num_sigmas):
+            gamma = (
+                min(self.s_churn / (num_sigmas - 1), 2**0.5 - 1)
+                if self.s_tmin &lt;= sigmas[i] &lt;= self.s_tmax
+                else 0.0
+            )
+            x = self.sampler_step(
+                s_in * sigmas[i],
+                s_in * sigmas[i + 1],
+                denoiser,
+                x,
+                cond,
+                uc,
+                gamma,
+            )
+
+        return x
+
+class EulerEDMSampler(EDMSampler):
+    def possible_correction_step(
+        self, euler_step, x, d, dt, next_sigma, denoiser, cond, uc
+    ):
+        return euler_step
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-Pipeline推理-1.1]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-tui-li-11/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-tui-li-11/">
+        </link>
+        <updated>2024-09-14T08:21:55.000Z</updated>
+        <content type="html"><![CDATA[<p>整体参考generative-models/tests/inference/test_inference.py，很多重要方法来自于sgm/inference/api.py</p>
+<p>这里我将test_inference.py里面代码自己改写，不走pytest的流程，并将一些东西直接初始化一个实例而不是通过config的方式去初始化。</p>
+<h1 id="基本参数">基本参数</h1>
+<p>基本上就是一些数据、枚举类型的定义和声明</p>
+<ul>
+<li>ModelArchitecture是模型架构枚举类的定义，我们使用SDXL_V1_BASE就行</li>
+<li>Sampler是采样器枚举类的定义</li>
+<li>Discretization是调度器枚举类的定义，这里就分为两种：传统DDPM和EDM调度器</li>
+<li>Guider是指导消噪过程的guider类的定义，这里也就两种：恒等和按比例</li>
+<li>SamplingParams是一个数据类，用于整个采样过程中所需要的所有参数的总结</li>
+<li>SamplingSpec与SamplingParams类似，指特别参数，这里是因为不同的模型架构可能需要的参数不同所以才需要特别指出</li>
+</ul>
+<pre><code class="language-python3"># api.py
+class ModelArchitecture(str, Enum):
+    SD_2_1 = &quot;stable-diffusion-v2-1&quot;
+    SD_2_1_768 = &quot;stable-diffusion-v2-1-768&quot;
+    SDXL_V0_9_BASE = &quot;stable-diffusion-xl-v0-9-base&quot;
+    SDXL_V0_9_REFINER = &quot;stable-diffusion-xl-v0-9-refiner&quot;
+    SDXL_V1_BASE = &quot;stable-diffusion-xl-v1-base&quot;
+    SDXL_V1_REFINER = &quot;stable-diffusion-xl-v1-refiner&quot;
+
+
+class Sampler(str, Enum):
+    EULER_EDM = &quot;EulerEDMSampler&quot;
+    HEUN_EDM = &quot;HeunEDMSampler&quot;
+    EULER_ANCESTRAL = &quot;EulerAncestralSampler&quot;
+    DPMPP2S_ANCESTRAL = &quot;DPMPP2SAncestralSampler&quot;
+    DPMPP2M = &quot;DPMPP2MSampler&quot;
+    LINEAR_MULTISTEP = &quot;LinearMultistepSampler&quot;
+
+
+class Discretization(str, Enum):
+    LEGACY_DDPM = &quot;LegacyDDPMDiscretization&quot;
+    EDM = &quot;EDMDiscretization&quot;
+
+
+class Guider(str, Enum):
+    VANILLA = &quot;VanillaCFG&quot;
+    IDENTITY = &quot;IdentityGuider&quot;
+
+
+class Thresholder(str, Enum):
+    NONE = &quot;None&quot;
+
+# 使用 @dataclass 装饰器可以自动生成一些常见的特殊方法，如 __init__、__repr__、__eq__ 等。简化类的定义
+@dataclass
+class SamplingParams:
+    width: int = 1024
+    height: int = 1024
+    steps: int = 50
+    sampler: Sampler = Sampler.DPMPP2M
+    discretization: Discretization = Discretization.LEGACY_DDPM
+    guider: Guider = Guider.VANILLA
+    thresholder: Thresholder = Thresholder.NONE
+    scale: float = 6.0
+    aesthetic_score: float = 5.0
+    negative_aesthetic_score: float = 5.0
+    img2img_strength: float = 1.0
+    orig_width: int = 1024
+    orig_height: int = 1024
+    crop_coords_top: int = 0
+    crop_coords_left: int = 0
+    sigma_min: float = 0.0292
+    sigma_max: float = 14.6146
+    rho: float = 3.0
+    s_churn: float = 0.0
+    s_tmin: float = 0.0
+    s_tmax: float = 999.0
+    s_noise: float = 1.0
+    eta: float = 1.0
+    order: int = 4
+
+
+@dataclass
+class SamplingSpec:
+    width: int
+    height: int
+    channels: int
+    factor: int
+    is_legacy: bool
+    config: str
+    ckpt: str
+    is_guided: bool
+
+
+model_specs = {
+    ModelArchitecture.SD_2_1: SamplingSpec(
+        height=512,
+        width=512,
+        channels=4,
+        factor=8,
+        is_legacy=True,
+        config=&quot;sd_2_1.yaml&quot;,
+        ckpt=&quot;v2-1_512-ema-pruned.safetensors&quot;,
+        is_guided=True,
+    ),
+    ModelArchitecture.SD_2_1_768: SamplingSpec(
+        height=768,
+        width=768,
+        channels=4,
+        factor=8,
+        is_legacy=True,
+        config=&quot;sd_2_1_768.yaml&quot;,
+        ckpt=&quot;v2-1_768-ema-pruned.safetensors&quot;,
+        is_guided=True,
+    ),
+    ModelArchitecture.SDXL_V0_9_BASE: SamplingSpec(
+        height=1024,
+        width=1024,
+        channels=4,
+        factor=8,
+        is_legacy=False,
+        config=&quot;sd_xl_base.yaml&quot;,
+        ckpt=&quot;sd_xl_base_0.9.safetensors&quot;,
+        is_guided=True,
+    ),
+    ModelArchitecture.SDXL_V0_9_REFINER: SamplingSpec(
+        height=1024,
+        width=1024,
+        channels=4,
+        factor=8,
+        is_legacy=True,
+        config=&quot;sd_xl_refiner.yaml&quot;,
+        ckpt=&quot;sd_xl_refiner_0.9.safetensors&quot;,
+        is_guided=True,
+    ),
+    ModelArchitecture.SDXL_V1_BASE: SamplingSpec(
+        height=1024,
+        width=1024,
+        channels=4,
+        factor=8,
+        is_legacy=False,
+        config=&quot;sd_xl_base.yaml&quot;,
+        ckpt=&quot;sd_xl_base_1.0.safetensors&quot;,
+        is_guided=True,
+    ),
+    ModelArchitecture.SDXL_V1_REFINER: SamplingSpec(
+        height=1024,
+        width=1024,
+        channels=4,
+        factor=8,
+        is_legacy=True,
+        config=&quot;sd_xl_refiner.yaml&quot;,
+        ckpt=&quot;sd_xl_refiner_1.0.safetensors&quot;,
+        is_guided=True,
+    ),
+}
+</code></pre>
+<h1 id="samplingpipeline">SamplingPipeline</h1>
+<p>在声明确定了各种参数之后，就可以开始准备推理流程了，首先需要初始化一个采样的pipeline<br>
+pipeline包含四个主要内容：<br>
+1.初始化(load模型)<br>
+2.完成text2img<br>
+3.完成img2img<br>
+4.SDXL中还有一个refine过程，其实本质就是img2img<br>
+我会主要解释一下1和2，因为3、4是类似的</p>
+<pre><code class="language-python3">class SamplingPipeline:
+    def __init__(
+        self,
+        model_id: ModelArchitecture, # 模型的id，也就是上面的枚举类
+        model_path=&quot;checkpoints&quot;, # 模型的存放路径
+        config_path=&quot;configs/inference&quot;, # 模型对应的config路径
+        device=&quot;cuda&quot;, 
+        use_fp16=True,
+    ) -&gt; None:
+        if model_id not in model_specs:
+            raise ValueError(f&quot;Model {model_id} not supported&quot;)
+        self.model_id = model_id
+        self.specs = model_specs[self.model_id] # 这里通过model_id拿到之前对应不同的model的不同参数
+        self.config = str(pathlib.Path(config_path, self.specs.config))
+        self.ckpt = str(pathlib.Path(model_path, self.specs.ckpt))
+        self.device = device
+        # 初始化的核心步骤就是能够正确的初始化model
+        self.model = self._load_model(device=device, use_fp16=use_fp16)
+
+    def _load_model(self, device=&quot;cuda&quot;, use_fp16=True):
+        # 从config去load模型，主要就是看是ckpt格式还是safetensor格式
+        # 然后会打印一些缺失的模型结构名称等等
+        config = OmegaConf.load(self.config)
+        model = load_model_from_config(config, self.ckpt)
+        if model is None:
+            raise ValueError(f&quot;Model {self.model_id} could not be loaded&quot;)
+        model.to(device)
+        # 要注意模型被分为了conditioner、model、denoiser等几部分
+        if use_fp16:
+            model.conditioner.half()
+            model.model.half()
+        return model
+
+    def text_to_image(
+        self,
+        params: SamplingParams,
+        prompt: str,
+        negative_prompt: str = &quot;&quot;,
+        samples: int = 1,
+        return_latents: bool = False,
+    ):
+        sampler = get_sampler_config(params) # 初始化采样器
+        value_dict = asdict(params) # 将之前的@dataclass类转直接转化为字典
+        value_dict[&quot;prompt&quot;] = prompt
+        value_dict[&quot;negative_prompt&quot;] = negative_prompt
+        value_dict[&quot;target_width&quot;] = params.width
+        value_dict[&quot;target_height&quot;] = params.height
+        # do_sample是本质函数
+        return do_sample(
+            self.model,
+            sampler,
+            value_dict,
+            samples,
+            params.height,
+            params.width,
+            self.specs.channels,
+            self.specs.factor,
+            force_uc_zero_embeddings=[&quot;txt&quot;] if not self.specs.is_legacy else [],
+            return_latents=return_latents,
+            filter=None,
+        )
+
+    def image_to_image(
+        self,
+        params: SamplingParams,
+        image,
+        prompt: str,
+        negative_prompt: str = &quot;&quot;,
+        samples: int = 1,
+        return_latents: bool = False,
+    ):
+        sampler = get_sampler_config(params)
+
+        if params.img2img_strength &lt; 1.0:
+            sampler.discretization = Img2ImgDiscretizationWrapper(
+                sampler.discretization,
+                strength=params.img2img_strength,
+            )
+        height, width = image.shape[2], image.shape[3]
+        value_dict = asdict(params)
+        value_dict[&quot;prompt&quot;] = prompt
+        value_dict[&quot;negative_prompt&quot;] = negative_prompt
+        value_dict[&quot;target_width&quot;] = width
+        value_dict[&quot;target_height&quot;] = height
+        return do_img2img(
+            image,
+            self.model,
+            sampler,
+            value_dict,
+            samples,
+            force_uc_zero_embeddings=[&quot;txt&quot;] if not self.specs.is_legacy else [],
+            return_latents=return_latents,
+            filter=None,
+        )
+
+    def refiner(
+        self,
+        params: SamplingParams,
+        image,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        samples: int = 1,
+        return_latents: bool = False,
+    ):
+        sampler = get_sampler_config(params)
+        value_dict = {
+            &quot;orig_width&quot;: image.shape[3] * 8,
+            &quot;orig_height&quot;: image.shape[2] * 8,
+            &quot;target_width&quot;: image.shape[3] * 8,
+            &quot;target_height&quot;: image.shape[2] * 8,
+            &quot;prompt&quot;: prompt,
+            &quot;negative_prompt&quot;: negative_prompt,
+            &quot;crop_coords_top&quot;: 0,
+            &quot;crop_coords_left&quot;: 0,
+            &quot;aesthetic_score&quot;: 6.0,
+            &quot;negative_aesthetic_score&quot;: 2.5,
+        }
+
+        return do_img2img(
+            image,
+            self.model,
+            sampler,
+            value_dict,
+            samples,
+            skip_encode=True,
+            return_latents=return_latents,
+            filter=None,
+        )
+</code></pre>
+<h1 id="sampler">sampler</h1>
+<p>采样器主要分三个内容：离散方法(噪声控制器)、guider方法(去噪控制器)、采样器</p>
+<pre><code class="language-python3">def get_sampler_config(params: SamplingParams):
+    # 通过config初始化采样器
+    # 主要初始化两个东西，一个离散化的config
+    # 一个是guider的config
+    discretization_config = get_discretization_config(params)
+    guider_config = get_guider_config(params)
+    sampler = None
+    if params.sampler == Sampler.EULER_EDM:
+        return EulerEDMSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            s_churn=params.s_churn,
+            s_tmin=params.s_tmin,
+            s_tmax=params.s_tmax,
+            s_noise=params.s_noise,
+            verbose=True,
+        )
+    if params.sampler == Sampler.HEUN_EDM:
+        return HeunEDMSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            s_churn=params.s_churn,
+            s_tmin=params.s_tmin,
+            s_tmax=params.s_tmax,
+            s_noise=params.s_noise,
+            verbose=True,
+        )
+    if params.sampler == Sampler.EULER_ANCESTRAL:
+        return EulerAncestralSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            eta=params.eta,
+            s_noise=params.s_noise,
+            verbose=True,
+        )
+    if params.sampler == Sampler.DPMPP2S_ANCESTRAL:
+        return DPMPP2SAncestralSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            eta=params.eta,
+            s_noise=params.s_noise,
+            verbose=True,
+        )
+    if params.sampler == Sampler.DPMPP2M:
+        return DPMPP2MSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            verbose=True,
+        )
+    if params.sampler == Sampler.LINEAR_MULTISTEP:
+        return LinearMultistepSampler(
+            num_steps=params.steps,
+            discretization_config=discretization_config,
+            guider_config=guider_config,
+            order=params.order,
+            verbose=True,
+        )
+
+    raise ValueError(f&quot;unknown sampler {params.sampler}!&quot;)
+</code></pre>
+<h2 id="discretization">discretization</h2>
+<p>可以看到在得到discretization的config后，sampler初始化会用到它，在/sgm/modules/diffusionmodules/sampling.py的31行可以看到instantiate_from_config的调用，用于初始化一个discretization。方法是utils.py模块中的instantiate_from_config和get_obj_from_str方法，就是通过config字段去有选择的import module，这种通过配置文件去import module的方式可以学习一下。<br>
+最后，discretization类的实现都在sgm/modules/diffusionmodules/discretizer.py下，这里分部进行注释。</p>
+<h3 id="基类">基类</h3>
+<p>一句话，Discretization就是在完成<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>序列的生成(实际上就是论文里面的time step)。<br>
+确定采样步数(step_num)和sigma后</p>
+<pre><code class="language-python3">class Discretization:
+    def __call__(self, n, do_append_zero=True, device=&quot;cpu&quot;, flip=False):
+        # 重点就是get_sigmas方法，父类定义了个抽象方法，由子类具体实现
+        # 这里也是区分了EDM和DDPM两种不同的实现
+        sigmas = self.get_sigmas(n, device=device)
+        # 
+        sigmas = append_zero(sigmas) if do_append_zero else sigmas
+        return sigmas if not flip else torch.flip(sigmas, (0,))
+
+    @abstractmethod
+    def get_sigmas(self, n, device):
+        pass
+</code></pre>
+<h3 id="edm">EDM</h3>
+<p>可以参照EDM论文：<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726625302334.png" alt="" loading="lazy"></p>
+<pre><code class="language-python3">class EDMDiscretization(Discretization):
+    def __init__(self, sigma_min=0.002, sigma_max=80.0, rho=7.0):
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.rho = rho
+
+    def get_sigmas(self, n, device=&quot;cpu&quot;):
+        # 跟论文的表格一模一样
+        ramp = torch.linspace(0, 1, n, device=device)
+        min_inv_rho = self.sigma_min ** (1 / self.rho)
+        max_inv_rho = self.sigma_max ** (1 / self.rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.rho
+        return sigmas
+</code></pre>
+<h3 id="ddpm">DDPM</h3>
+<p>生成一组线性序列<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>β</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\beta_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8888799999999999em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.05278em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.05278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>函数，噪声强度的调度由<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>β</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\beta_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8888799999999999em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.05278em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.05278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>控制<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726626467584.png" alt="" loading="lazy"></p>
+<pre><code class="language-python3">def make_beta_schedule(
+    schedule,
+    n_timestep,
+    linear_start=1e-4,
+    linear_end=2e-2,
+):
+    if schedule == &quot;linear&quot;:
+        betas = (
+            torch.linspace(
+                linear_start**0.5, linear_end**0.5, n_timestep, dtype=torch.float64
+            )
+            ** 2
+        )
+    return betas.numpy()
+</code></pre>
+<p>初始化先生成一组线性序列<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>β</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\beta_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8888799999999999em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.05278em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.05278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，然后计算<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>α</mi><mi>t</mi></msub><mo>=</mo><mn>1</mn><mo>−</mo><msub><mi>β</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\alpha_t = 1 - \beta_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:0.72777em;vertical-align:-0.08333em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222222222222222em;"></span></span><span class="base"><span class="strut" style="height:0.8888799999999999em;vertical-align:-0.19444em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.05278em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.05278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>和<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mover accent="true"><msub><mi>α</mi><mi>t</mi></msub><mo>ˉ</mo></mover><mo>=</mo><msubsup><mo>∏</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>t</mi></msubsup><msub><mi>α</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\bar{\alpha_t} = \prod_{i=1}^t \alpha_i</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.71778em;vertical-align:-0.15em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.56778em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">ˉ</span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2777777777777778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2777777777777778em;"></span></span><span class="base"><span class="strut" style="height:1.233166em;vertical-align:-0.29971000000000003em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:-0.0000050000000000050004em;">∏</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.933456em;"><span style="top:-2.40029em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathdefault mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.2029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.29971000000000003em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.16666666666666666em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.31166399999999994em;"><span style="top:-2.5500000000000003em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>，<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mover accent="true"><msub><mi>α</mi><mi>t</mi></msub><mo>ˉ</mo></mover></mrow><annotation encoding="application/x-tex">\bar{\alpha_t}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.71778em;vertical-align:-0.15em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.56778em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathdefault" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;">ˉ</span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span>可以看作每个时间步累计的噪声强度。</p>
+<pre><code class="language-python3">## 生成从max_step - 1到0之间的num_substeps个等间隔的数值。
+def generate_roughly_equally_spaced_steps(
+    num_substeps: int, max_step: int
+) -&gt; np.ndarray:
+    return np.linspace(max_step - 1, 0, num_substeps, endpoint=False).astype(int)[::-1]
+
+
+class LegacyDDPMDiscretization(Discretization):
+    def __init__(
+        self,
+        linear_start=0.00085,
+        linear_end=0.0120,
+        num_timesteps=1000,
+    ):
+        super().__init__()
+        self.num_timesteps = num_timesteps
+        # 生成beta序列
+        betas = make_beta_schedule(
+            &quot;linear&quot;, num_timesteps, linear_start=linear_start, linear_end=linear_end
+        )
+        alphas = 1.0 - betas
+        # 计算alpha-bar
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.to_torch = partial(torch.tensor, dtype=torch.float32)
+</code></pre>
+<p>最后生成标准差<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msub><mi>σ</mi><mi>t</mi></msub></mrow><annotation encoding="application/x-tex">\sigma_t</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.58056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathdefault" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2805559999999999em;"><span style="top:-2.5500000000000003em;margin-left:-0.03588em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>的序列为<span class="katex"><span class="katex-mathml"><math><semantics><mrow><msqrt><mfrac><mrow><mn>1</mn><mo>−</mo><msub><mover accent="true"><mi>α</mi><mo>ˉ</mo></mover><mi>t</mi></msub></mrow><msub><mover accent="true"><mi>α</mi><mo>ˉ</mo></mover><mi>t</mi></msub></mfrac></msqrt></mrow><annotation encoding="application/x-tex">\sqrt{\frac{1 - \bar\alpha_t}{\bar\alpha_t}}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.8399999999999999em;vertical-align:-0.6469459999999999em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.193054em;"><span class="svg-align" style="top:-3.8em;"><span class="pstrut" style="height:3.8em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8612079999999999em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.56778em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathdefault mtight" style="margin-right:0.0037em;">α</span></span><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.22222em;"><span class="mtight">ˉ</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.29634285714285713em;"><span style="top:-2.357em;margin-left:-0.0037em;margin-right:0.07142857142857144em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.4101em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mtight"><span class="mord accent mtight"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.56778em;"><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="mord mathdefault mtight" style="margin-right:0.0037em;">α</span></span><span style="top:-2.7em;"><span class="pstrut" style="height:2.7em;"></span><span class="accent-body" style="left:-0.22222em;"><span class="mtight">ˉ</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.29634285714285713em;"><span style="top:-2.357em;margin-left:-0.0037em;margin-right:0.07142857142857144em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathdefault mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.44509999999999994em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span><span style="top:-3.153054em;"><span class="pstrut" style="height:3.8em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.8800000000000001em;"><svg width='400em' height='1.8800000000000001em' viewBox='0 0 400000 1944' preserveAspectRatio='xMinYMin slice'><path d='M1001,80H400000v40H1013.1s-83.4,268,-264.1,840c-180.7,
+572,-277,876.3,-289,913c-4.7,4.7,-12.7,7,-24,7s-12,0,-12,0c-1.3,-3.3,-3.7,-11.7,
+-7,-25c-35.3,-125.3,-106.7,-373.3,-214,-744c-10,12,-21,25,-33,39s-32,39,-32,39
+c-6,-5.3,-15,-14,-27,-26s25,-30,25,-30c26.7,-32.7,52,-63,76,-91s52,-60,52,-60
+s208,722,208,722c56,-175.3,126.3,-397.3,211,-666c84.7,-268.7,153.8,-488.2,207.5,
+-658.5c53.7,-170.3,84.5,-266.8,92.5,-289.5c4,-6.7,10,-10,18,-10z
+M1001 80H400000v40H1013z'/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.6469459999999999em;"><span></span></span></span></span></span></span></span></span></p>
+<pre><code class="language-python3">    def get_sigmas(self, n, device=&quot;cpu&quot;):
+        # n如果小于1000步就重新在1000步里面取n个点出来，对应上原来的alpha-bar
+        if n &lt; self.num_timesteps:
+            timesteps = generate_roughly_equally_spaced_steps(n, self.num_timesteps)
+            alphas_cumprod = self.alphas_cumprod[timesteps]
+        elif n == self.num_timesteps:
+            alphas_cumprod = self.alphas_cumprod
+        else:
+            raise ValueError
+
+        to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
+        sigmas = to_torch((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
+        return torch.flip(sigmas, (0,))
+</code></pre>
+<h2 id="guider">Guider</h2>
+<p>guider有两个作用，一个是准备去噪器的输入参数（prepare_inputs方法），一个是对去噪的结果再进行一点后处理（<strong>call</strong>）。</p>
+<h3 id="prepare_inputs">prepare_inputs</h3>
+<p>准备去噪器的输入参数基本上是一套固定的流程，不同的guider基本上都一致。<br>
+x表示输入，s表示sigma，c和uc表示条件向量和无条件向量。<br>
+主要其实就是将c和uc合并放到一个dict里面。</p>
+<pre><code class="language-python3">def prepare_inputs(self, x, s, c, uc):
+        c_out = dict()
+
+        for k in c:
+            if k in [&quot;vector&quot;, &quot;crossattn&quot;, &quot;concat&quot;]:
+                c_out[k] = torch.cat((uc[k], c[k]), 0)
+            else:
+                assert c[k] == uc[k]
+                c_out[k] = c[k]
+        return torch.cat([x] * 2), torch.cat([s] * 2), c_out
+</code></pre>
+<h3 id="call-guider">call guider</h3>
+<p>去噪后会有两个输出，一个是有条件输出一个是无条件输出，cat在一起也就是x（guider的输入）<br>
+比如IdentityGuider就是直接返回x</p>
+<pre><code class="language-python3">    def __call__(self, x: torch.Tensor, sigma: torch.Tensor) -&gt; torch.Tensor:
+        x_u, x_c = x.chunk(2) # 把denoiser的输出分为无条件结果和有条件结果
+        x_pred = x_u + self.scale * (x_c - x_u) # 根据scale混合
+        return x_pred
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[SDXL代码阅读-概览-1]]></title>
+        <id>https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-gai-lan/</id>
+        <link href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-gai-lan/">
+        </link>
+        <updated>2024-09-14T07:06:36.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="必要了解">必要了解</h1>
+<p>搜索了一圈发现网上对于SDXL的代码讲解很少，因此自己记录一下代码的理解。</p>
+<p>在阅读或了解SD、SDXL这之类的生成模型（扩散生成模型）需要基本了解其数学原理，也许不必非常理解或懂得其中的公式推导，但要基本知道最终作者想要表达啥（也就是代码可能会怎么写）。下面是我学习的一些经历，由于我目前也是快速过了一遍大概知识，也是一知半解，所以我会把我觉得有用的论文、参考、学习视频等放在下面。</p>
+<p><a href="https://arxiv.org/abs/2006.11239">DDPM论文，经典入门</a><br>
+<a href="https://arxiv.org/pdf/2011.13456">Score-SDE论文，讲述了生成过程可以看作一个随机微分方程</a><br>
+<a href="https://arxiv.org/pdf/2206.00364">EDM论文，将生成模型整合到一个框架里</a><br>
+当然还有DDIM、Consistency Model、ODE等，可以等有时间了再详细了解，我认为看完上面三篇论文对目前或者说对SDXL的代码理解基本够了。</p>
+<p><a href="https://space.bilibili.com/13355688/?spm_id_from=333.999.0.0">对于扩散模型以及SDE的推导非常通俗易懂</a><br>
+<a href="https://space.bilibili.com/104488375/channel/collectiondetail?sid=3628621">虽然up语速非常快，但她是我目前搜到唯一推导EDM论文的大佬，而且推导也很清晰(虽然我还是有看不懂的)</a><br>
+<a href="https://www.bilibili.com/video/BV1b541197HX/?spm_id_from=333.999.0.0">DDPM基本讲解包括简单的代码实现，很详细，入门必看</a><br>
+<a href="https://www.cnblogs.com/huggingface/p/17040321.html">huggingface自己的扩散模型教程汉化，目前我还没看，但感觉应该不错</a></p>
+<h1 id="sdxl环境安装">SDXL环境安装</h1>
+<p>SDXL的环境真是一言难尽。。<br>
+<a href="https://github.com/Stability-AI/generative-models">SDXL的git地址</a><br>
+先正常按照官方的流程来安装环境，至于是用venv还是conda或者docker都可以<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726299462743.png" alt="" loading="lazy"><br>
+然后按照官方的链接下载SDXL-1.0的模型，0.9的模型似乎还要申请权限才能下载，至于别的版本我没有试过。<br>
+这样基本的准备工作就已经完成了，后面我们可以参照其tests/inference文件夹下的代码先来测试生成一张图片，然后就会碰到两个巨大的坑：<br>
+<strong>坑1，源码有点错误</strong><br>
+调用sgm/inference/api.py的text_to_image函数时，出现<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726300808409.png" alt="" loading="lazy"><br>
+看了一下，这里是api.py的280行get_guider_config函数初始化guider类的参数的时候会初始化一个dyn_thresh_config的值，但我看了他们的guider.py，没有接收这个参数的类😂，所以报错，这里修改方式有两种，一种是注释掉它初始化的那个的参数：</p>
+<pre><code class="language-python3"># &quot;params&quot;: {&quot;scale&quot;: scale, &quot;dyn_thresh_config&quot;: dyn_thresh_config},
+&quot;params&quot;: {&quot;scale&quot;: scale},
+</code></pre>
+<p>第二种是修改58行guider: Guider = Guider.VANILLA改为guider: Guider = Guider.IDENTITY，这样就不会去加载参数来初始化那个不对应的类了。<br>
+<strong>坑2，clip版本可能有错误</strong><br>
+如果出现：RuntimeError: The shape of the 2D attn_mask is torch.Size([77, 77]), but should be (1, 1).<br>
+参考https://github.com/TencentARC/MotionCtrl/issues/31，重新安装clip版本即可。<br>
+<strong>pip install open-clip-torch==2.24.0</strong></p>
+]]></content>
+    </entry>
+</feed>

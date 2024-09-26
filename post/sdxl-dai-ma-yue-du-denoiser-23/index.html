@@ -1,0 +1,233 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDXL代码阅读-Denoiser-2.3 | 谢狗个人博客</title>
+<link rel="shortcut icon" href="https://ShiMinghao0208.github.io/favicon.ico?v=1727341370783">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://ShiMinghao0208.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="SDXL代码阅读-Denoiser-2.3 | 谢狗个人博客 - Atom Feed" href="https://ShiMinghao0208.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="基于score matching的 denoising
+
+在DiffusionEngine中，我们初始化了denoiser，在loss和sample都会调用它，现在来看一下denosier大致做了什么。
+denoiser
+文件在genera..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://ShiMinghao0208.github.io">
+  <img class="avatar" src="https://ShiMinghao0208.github.io/images/avatar.png?v=1727341370783" alt="">
+  </a>
+  <h1 class="site-title">
+    谢狗个人博客
+  </h1>
+  <p class="site-description">
+    我不姓谢，但最怕万一见温柔
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="https://ShiMinghao0208.github.io/tags" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              SDXL代码阅读-Denoiser-2.3
+            </h2>
+            <div class="post-info">
+              <span>
+                2024-09-24
+              </span>
+              <span>
+                2 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h1 id="基于score-matching的-denoising">基于score matching的 denoising</h1>
+<p><img src="https://ShiMinghao0208.github.io/post-images/1727164577579.png" alt="" loading="lazy"><br>
+在DiffusionEngine中，我们初始化了denoiser，在loss和sample都会调用它，现在来看一下denosier大致做了什么。</p>
+<h2 id="denoiser">denoiser</h2>
+<p>文件在generative-models/sgm/modules/diffusionmodules/denoiser.py<br>
+代码很短，也确实没有什么可说的，跟截图公式基本对应。离散的去噪器实现感觉像是没写完的样子，看起来没有什么用，因为只是修改了sigma的来源，通过Discretization去生成sigma，但是本来的denoiser类接收的sigma就是通过Discretization生成的吧。</p>
+<pre><code class="language-python3">class Denoiser(nn.Module):
+    def __init__(self, scaling_config: Dict):
+        super().__init__()
+
+        self.scaling: DenoiserScaling = instantiate_from_config(scaling_config)
+
+    def possibly_quantize_sigma(self, sigma: torch.Tensor) -&gt; torch.Tensor:
+        return sigma
+
+    def possibly_quantize_c_noise(self, c_noise: torch.Tensor) -&gt; torch.Tensor:
+        return c_noise
+
+    def forward(
+        self,
+        network: nn.Module,
+        input: torch.Tensor,
+        sigma: torch.Tensor,
+        cond: Dict,
+        **additional_model_inputs,
+    ) -&gt; torch.Tensor:
+        sigma = self.possibly_quantize_sigma(sigma)
+        sigma_shape = sigma.shape
+        sigma = append_dims(sigma, input.ndim)
+        # 重点就在这里，对应论文公式的几个参数
+        c_skip, c_out, c_in, c_noise = self.scaling(sigma)
+        c_noise = self.possibly_quantize_c_noise(c_noise.reshape(sigma_shape))
+        # 这里return的结果就对应论文的公式
+        return (
+            network(input * c_in, c_noise, cond, **additional_model_inputs) * c_out
+            + input * c_skip
+        )
+</code></pre>
+<h2 id="denoiserscaling">DenoiserScaling</h2>
+<p>这个就是用来跟论文里表格进行匹配，生成对应的公式参数<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727166561725.png" alt="" loading="lazy"><br>
+注意sigma_data的值来自于配置文件，我看了mnist里面设置的就是1.0</p>
+<pre><code class="language-python3">class DenoiserScaling(ABC):
+    @abstractmethod
+    def __call__(
+        self, sigma: torch.Tensor
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pass
+
+
+class EDMScaling:
+    def __init__(self, sigma_data: float = 0.5):
+        self.sigma_data = sigma_data
+
+    def __call__(
+        self, sigma: torch.Tensor
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
+        c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
+        c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
+        c_noise = 0.25 * sigma.log()
+        return c_skip, c_out, c_in, c_noise
+</code></pre>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#%E5%9F%BA%E4%BA%8Escore-matching%E7%9A%84-denoising">基于score matching的 denoising</a>
+<ul>
+<li><a href="#denoiser">denoiser</a></li>
+<li><a href="#denoiserscaling">DenoiserScaling</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-xun-lian-pytorch-lightning-22/">
+              <h3 class="post-title">
+                SDXL代码阅读-训练(pytorch lightning)-2.2 
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://ShiMinghao0208.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

@@ -1,0 +1,195 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDXL代码阅读-概览-1 | 谢狗个人博客</title>
+<link rel="shortcut icon" href="https://ShiMinghao0208.github.io/favicon.ico?v=1727341370783">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://ShiMinghao0208.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="SDXL代码阅读-概览-1 | 谢狗个人博客 - Atom Feed" href="https://ShiMinghao0208.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="必要了解
+搜索了一圈发现网上对于SDXL的代码讲解很少，因此自己记录一下代码的理解。
+在阅读或了解SD、SDXL这之类的生成模型（扩散生成模型）需要基本了解其数学原理，也许不必非常理解或懂得其中的公式推导，但要基本知道最终作者想要表达啥（也..." />
+    <meta name="keywords" content="SDXL,AIGC学习" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://ShiMinghao0208.github.io">
+  <img class="avatar" src="https://ShiMinghao0208.github.io/images/avatar.png?v=1727341370783" alt="">
+  </a>
+  <h1 class="site-title">
+    谢狗个人博客
+  </h1>
+  <p class="site-description">
+    我不姓谢，但最怕万一见温柔
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="https://ShiMinghao0208.github.io/tags" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              SDXL代码阅读-概览-1
+            </h2>
+            <div class="post-info">
+              <span>
+                2024-09-14
+              </span>
+              <span>
+                3 min read
+              </span>
+              
+                <a href="https://ShiMinghao0208.github.io/tag/354-myU_X/" class="post-tag">
+                  # SDXL
+                </a>
+              
+                <a href="https://ShiMinghao0208.github.io/tag/V3dvREVpE/" class="post-tag">
+                  # AIGC学习
+                </a>
+              
+            </div>
+            
+              <img class="post-feature-image" src="https://ShiMinghao0208.github.io/post-images/sdxl-dai-ma-yue-du-gai-lan.jpg" alt="">
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h1 id="必要了解">必要了解</h1>
+<p>搜索了一圈发现网上对于SDXL的代码讲解很少，因此自己记录一下代码的理解。</p>
+<p>在阅读或了解SD、SDXL这之类的生成模型（扩散生成模型）需要基本了解其数学原理，也许不必非常理解或懂得其中的公式推导，但要基本知道最终作者想要表达啥（也就是代码可能会怎么写）。下面是我学习的一些经历，由于我目前也是快速过了一遍大概知识，也是一知半解，所以我会把我觉得有用的论文、参考、学习视频等放在下面。</p>
+<p><a href="https://arxiv.org/abs/2006.11239">DDPM论文，经典入门</a><br>
+<a href="https://arxiv.org/pdf/2011.13456">Score-SDE论文，讲述了生成过程可以看作一个随机微分方程</a><br>
+<a href="https://arxiv.org/pdf/2206.00364">EDM论文，将生成模型整合到一个框架里</a><br>
+当然还有DDIM、Consistency Model、ODE等，可以等有时间了再详细了解，我认为看完上面三篇论文对目前或者说对SDXL的代码理解基本够了。</p>
+<p><a href="https://space.bilibili.com/13355688/?spm_id_from=333.999.0.0">对于扩散模型以及SDE的推导非常通俗易懂</a><br>
+<a href="https://space.bilibili.com/104488375/channel/collectiondetail?sid=3628621">虽然up语速非常快，但她是我目前搜到唯一推导EDM论文的大佬，而且推导也很清晰(虽然我还是有看不懂的)</a><br>
+<a href="https://www.bilibili.com/video/BV1b541197HX/?spm_id_from=333.999.0.0">DDPM基本讲解包括简单的代码实现，很详细，入门必看</a><br>
+<a href="https://www.cnblogs.com/huggingface/p/17040321.html">huggingface自己的扩散模型教程汉化，目前我还没看，但感觉应该不错</a></p>
+<h1 id="sdxl环境安装">SDXL环境安装</h1>
+<p>SDXL的环境真是一言难尽。。<br>
+<a href="https://github.com/Stability-AI/generative-models">SDXL的git地址</a><br>
+先正常按照官方的流程来安装环境，至于是用venv还是conda或者docker都可以<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726299462743.png" alt="" loading="lazy"><br>
+然后按照官方的链接下载SDXL-1.0的模型，0.9的模型似乎还要申请权限才能下载，至于别的版本我没有试过。<br>
+这样基本的准备工作就已经完成了，后面我们可以参照其tests/inference文件夹下的代码先来测试生成一张图片，然后就会碰到两个巨大的坑：<br>
+<strong>坑1，源码有点错误</strong><br>
+调用sgm/inference/api.py的text_to_image函数时，出现<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1726300808409.png" alt="" loading="lazy"><br>
+看了一下，这里是api.py的280行get_guider_config函数初始化guider类的参数的时候会初始化一个dyn_thresh_config的值，但我看了他们的guider.py，没有接收这个参数的类😂，所以报错，这里修改方式有两种，一种是注释掉它初始化的那个的参数：</p>
+<pre><code class="language-python3"># &quot;params&quot;: {&quot;scale&quot;: scale, &quot;dyn_thresh_config&quot;: dyn_thresh_config},
+&quot;params&quot;: {&quot;scale&quot;: scale},
+</code></pre>
+<p>第二种是修改58行guider: Guider = Guider.VANILLA改为guider: Guider = Guider.IDENTITY，这样就不会去加载参数来初始化那个不对应的类了。<br>
+<strong>坑2，clip版本可能有错误</strong><br>
+如果出现：RuntimeError: The shape of the 2D attn_mask is torch.Size([77, 77]), but should be (1, 1).<br>
+参考https://github.com/TencentARC/MotionCtrl/issues/31，重新安装clip版本即可。<br>
+<strong>pip install open-clip-torch==2.24.0</strong></p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#%E5%BF%85%E8%A6%81%E4%BA%86%E8%A7%A3">必要了解</a></li>
+<li><a href="#sdxl%E7%8E%AF%E5%A2%83%E5%AE%89%E8%A3%85">SDXL环境安装</a></li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://ShiMinghao0208.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

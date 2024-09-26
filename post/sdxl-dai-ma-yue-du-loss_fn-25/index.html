@@ -1,0 +1,322 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDXL代码阅读-Loss_fn-2.5 | 谢狗个人博客</title>
+<link rel="shortcut icon" href="https://ShiMinghao0208.github.io/favicon.ico?v=1727341370783">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://ShiMinghao0208.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="SDXL代码阅读-Loss_fn-2.5 | 谢狗个人博客 - Atom Feed" href="https://ShiMinghao0208.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="Loss_fn
+前面讲的denosier、conditioner在DiffusionEngine的forward阶段都被送入self.loss_fn进行计算，因此Loss_fn具体做了什么也是串联前面内容的重要部分。
+由于Loss_fn的初..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://ShiMinghao0208.github.io">
+  <img class="avatar" src="https://ShiMinghao0208.github.io/images/avatar.png?v=1727341370783" alt="">
+  </a>
+  <h1 class="site-title">
+    谢狗个人博客
+  </h1>
+  <p class="site-description">
+    我不姓谢，但最怕万一见温柔
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="https://ShiMinghao0208.github.io/tags" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              SDXL代码阅读-Loss_fn-2.5
+            </h2>
+            <div class="post-info">
+              <span>
+                2024-09-25
+              </span>
+              <span>
+                4 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h1 id="loss_fn">Loss_fn</h1>
+<p>前面讲的denosier、conditioner在DiffusionEngine的forward阶段都被送入self.loss_fn进行计算，因此Loss_fn具体做了什么也是串联前面内容的重要部分。<br>
+由于Loss_fn的初始化也涉及到其他模块，先来阅读这些模块。<br>
+对应论文表格：<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727232060720.png" alt="" loading="lazy"></p>
+<h2 id="sigma_sampling">sigma_sampling</h2>
+<p>文件来自于generative-models/sgm/modules/diffusionmodules/sigma_sampling.py<br>
+从配置文件(sgm.modules.diffusionmodules.sigma_sampling.EDMSampling)可以知道导入的是EDMSampling，看了一下代码，实际上就是从正态分布里面采样。</p>
+<pre><code class="language-python3">class EDMSampling:
+    &quot;&quot;&quot;
+    通过均值和标准差来控制在对数标准正态分布里来采样
+    &quot;&quot;&quot;
+    def __init__(self, p_mean=-1.2, p_std=1.2):
+        self.p_mean = p_mean
+        self.p_std = p_std
+
+    def __call__(self, n_samples, rand=None):
+        log_sigma = self.p_mean + self.p_std * default(rand, torch.randn((n_samples,)))
+        return log_sigma.exp()
+</code></pre>
+<h2 id="loss_weighting">loss_weighting</h2>
+<p>文件来自于generative-models/sgm/modules/diffusionmodules/loss_weighting.py<br>
+也就是完全对应论文图片</p>
+<pre><code class="language-python3">class EDMWeighting(DiffusionLossWeighting):
+    def __init__(self, sigma_data: float = 0.5):
+        self.sigma_data = sigma_data
+
+    def __call__(self, sigma: torch.Tensor) -&gt; torch.Tensor:
+        return (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
+</code></pre>
+<h2 id="standarddiffusionloss">StandardDiffusionLoss</h2>
+<h3 id="init">init</h3>
+<pre><code class="language-python3">class StandardDiffusionLoss(nn.Module):
+    def __init__(
+        self,
+        sigma_sampler_config: dict,
+        loss_weighting_config: dict,
+        loss_type: str = &quot;l2&quot;,
+        offset_noise_level: float = 0.0,
+        batch2model_keys: Optional[Union[str, List[str]]] = None,
+    ):
+        super().__init__()
+
+        assert loss_type in [&quot;l2&quot;, &quot;l1&quot;, &quot;lpips&quot;]
+
+        self.sigma_sampler = instantiate_from_config(sigma_sampler_config)
+        self.loss_weighting = instantiate_from_config(loss_weighting_config)
+
+        self.loss_type = loss_type
+        self.offset_noise_level = offset_noise_level
+        
+        # lpips是一种用于衡量图像之间感知相似度的损失函数。
+        # 与传统的像素级损失（如 L1 或 L2 损失）不同，LPIPS 通过使用预训练的深度卷积神经网络来捕捉更接近人类视觉感知的相似性。
+        if loss_type == &quot;lpips&quot;:
+            self.lpips = LPIPS().eval()
+
+        if not batch2model_keys:
+            batch2model_keys = []
+        
+        # 模型额外输入的key
+        if isinstance(batch2model_keys, str):
+            batch2model_keys = [batch2model_keys]
+
+        self.batch2model_keys = set(batch2model_keys)
+</code></pre>
+<h3 id="forward">forward</h3>
+<p>真的的前向推理在_forward函数，forward函数就是生成了condition向量然后调用了_forward函数</p>
+<pre><code class="language-python3">    def get_noised_input(
+        self, sigmas_bc: torch.Tensor, noise: torch.Tensor, input: torch.Tensor
+    ) -&gt; torch.Tensor:
+        noised_input = input + noise * sigmas_bc
+        return noised_input
+
+    def forward(
+        self,
+        network: nn.Module,
+        denoiser: Denoiser,
+        conditioner: GeneralConditioner,
+        input: torch.Tensor,
+        batch: Dict,
+    ) -&gt; torch.Tensor:
+        cond = conditioner(batch)
+        return self._forward(network, denoiser, cond, input, batch)
+</code></pre>
+<h3 id="_forward">_forward</h3>
+<pre><code class="language-python3">    def _forward(
+        self,
+        network: nn.Module,
+        denoiser: Denoiser,
+        cond: Dict,
+        input: torch.Tensor,
+        batch: Dict,
+    ) -&gt; Tuple[torch.Tensor, Dict]:
+        # 可能会有一些额外输入
+        additional_model_inputs = {
+            key: batch[key] for key in self.batch2model_keys.intersection(batch)
+        }
+        # 生成对数正态分布的采样
+        sigmas = self.sigma_sampler(input.shape[0]).to(input)
+
+        # self.offset_noise_level &gt; 0.0的话就对noise再加偏移，这个偏移本身也是noise的
+        noise = torch.randn_like(input)
+        if self.offset_noise_level &gt; 0.0:
+            offset_shape = (
+                (input.shape[0], 1, input.shape[2])
+                if self.n_frames is not None
+                else (input.shape[0], input.shape[1])
+            )
+            noise = noise + self.offset_noise_level * append_dims(
+                torch.randn(offset_shape, device=input.device),
+                input.ndim,
+            )
+        
+        # 对图片加噪
+        sigmas_bc = append_dims(sigmas, input.ndim)
+        noised_input = self.get_noised_input(sigmas_bc, noise, input)
+
+        # 模型输出，也就是denoiser，也就是score matching
+        model_output = denoiser(
+            network, noised_input, sigmas, cond, **additional_model_inputs
+        )
+        # 计算权重
+        w = append_dims(self.loss_weighting(sigmas), input.ndim)
+        
+        # return就是具体loss，比如l2loss
+        return self.get_loss(model_output, input, w)
+
+    def get_loss(self, model_output, target, w):
+        if self.loss_type == &quot;l2&quot;:
+            return torch.mean(
+                (w * (model_output - target) ** 2).reshape(target.shape[0], -1), 1
+            )
+        elif self.loss_type == &quot;l1&quot;:
+            return torch.mean(
+                (w * (model_output - target).abs()).reshape(target.shape[0], -1), 1
+            )
+        elif self.loss_type == &quot;lpips&quot;:
+            loss = self.lpips(model_output, target).reshape(-1)
+            return loss
+        else:
+            raise NotImplementedError(f&quot;Unknown loss type {self.loss_type}&quot;)
+</code></pre>
+<h2 id="小结">小结</h2>
+<p>loss_fn相当于就是完成了论文中公式2、3<br>
+<img src="https://ShiMinghao0208.github.io/post-images/1727235102946.png" alt="" loading="lazy"><br>
+但是这里非常反直觉的一个点是，得分匹配计算的D()用于拟合实际图片输入y</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#loss_fn">Loss_fn</a>
+<ul>
+<li><a href="#sigma_sampling">sigma_sampling</a></li>
+<li><a href="#loss_weighting">loss_weighting</a></li>
+<li><a href="#standarddiffusionloss">StandardDiffusionLoss</a>
+<ul>
+<li><a href="#init">init</a></li>
+<li><a href="#forward">forward</a></li>
+<li><a href="#_forward">_forward</a></li>
+</ul>
+</li>
+<li><a href="#%E5%B0%8F%E7%BB%93">小结</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://ShiMinghao0208.github.io/post/sdxl-dai-ma-yue-du-conditioner-24/">
+              <h3 class="post-title">
+                SDXL代码阅读-Conditioner-2.4
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://ShiMinghao0208.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>
